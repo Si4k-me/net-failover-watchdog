@@ -1,10 +1,19 @@
-# net-failover-watchdog
+<p align="center">
+  <img src="assets/logo.png" alt="Net Failover Watchdog by SI4K" width="220">
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Linux / Arch](https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg)](https://archlinux.org)
-[![Tests: Passing](https://img.shields.io/badge/Tests-12%2F12%20Passing-brightgreen.svg)]()
+<h1 align="center">net-failover-watchdog</h1>
 
-> **Health-aware Linux network failover daemon with configurable interface priorities, hysteresis, IPv4 route management, and connectivity verification.**
+<p align="center">
+  <b>Health-aware Linux network failover daemon with configurable interface priorities, hysteresis, IPv4 route management, and connectivity verification</b><br>
+  <sub><i>by SI4K</i></sub>
+</p>
+
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
+  <img src="https://img.shields.io/badge/Tests-12%2F12%20Passing-brightgreen.svg" alt="Tests: 12/12 Passing">
+</p>
 
 `net-failover-watchdog` is a lightweight, hardened multi-WAN failover engine designed for Linux desktops, laptops, and edge devices that switch between **Ethernet**, **USB tethering / cellular modems**, and **Wi-Fi**.
 
