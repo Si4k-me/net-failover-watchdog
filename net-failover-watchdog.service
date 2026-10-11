@@ -1,0 +1,33 @@
+[Unit]
+Description=Health-aware Linux Network Failover Daemon
+Documentation=https://github.com/Akshitkamboz13/net-failover-watchdog
+After=network.target network-online.target systemd-resolved.service
+Wants=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/net-failover-watchdog
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+# Security Sandboxing & Linux Capabilities
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+PrivateTmp=true
+ReadWritePaths=/run /run/lock
+ReadOnlyPaths=/etc/net-failover-watchdog.conf /etc/net-failover-watchdog.d
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# Logging to System Journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net-failover-watchdog
+
+[Install]
+WantedBy=multi-user.target

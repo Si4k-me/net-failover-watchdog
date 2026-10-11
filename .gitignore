@@ -1,0 +1,18 @@
+# Makepkg build artifacts
+/pkg/
+/src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+
+# Test artifacts & locks
+/tests/tmp*
+*.lock
+*.fails
+*.successes
+*.rp_warned
+
+# Editor & temporary files
+*.swp
+*~
+.DS_Store

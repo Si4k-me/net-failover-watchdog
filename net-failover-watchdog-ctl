@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+#
+# net-failover-watchdog-ctl
+# CLI control interface for the net-failover-watchdog daemon.
+# Manages interface priorities, reloads configuration, and queries daemon state.
+#
+# Author: Akshit Kamboj
+# License: MIT
+#
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly CTL_VERSION="1.0.0"
+readonly MAIN_CONFIG="${CONFIG_FILE:-/etc/net-failover-watchdog.conf}"
+readonly DROP_IN_DIR="${DROP_IN_DIR:-/etc/net-failover-watchdog.d}"
+readonly PRIORITY_CONF="${DROP_IN_DIR}/priority.conf"
+readonly PID_LOCK="/run/lock/net-failover-watchdog.lock"
+readonly STATE_DIR="/run/net-failover-watchdog"
+readonly DAEMON_BIN="net-failover-watchdog"
+
+# ---------------------------------------------------------
+# COLOUR AND OUTPUT HELPERS
+# ---------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+if [[ ! -t 1 ]]; then
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+info()  { echo -e "${GREEN}✓${RESET} $*"; }
+warn()  { echo -e "${YELLOW}⚠${RESET} $*" >&2; }
+error() { echo -e "${RED}✗${RESET} $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+# ---------------------------------------------------------
+# DAEMON INTERACTION
+# ---------------------------------------------------------
+get_daemon_pid() {
+    if [[ -f "$PID_LOCK" ]]; then
+        local pid
+        pid=$(fuser "$PID_LOCK" 2>/dev/null | awk '{print $1}') || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    local pid
+    pid=$(pgrep -x "$DAEMON_BIN" 2>/dev/null | head -n1) || true
+    if [[ -n "$pid" ]]; then
+        echo "$pid"
+        return 0
+    fi
+    return 1
+}
+
+is_systemd_service_active() {
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet net-failover-watchdog.service 2>/dev/null
+}
+
+apply_new_order() {
+    # If systemd service is active, restart it (pauses then restarts with new order)
+    if is_systemd_service_active; then
+        info "Pausing and restarting net-failover-watchdog service with new order..."
+        if systemctl restart net-failover-watchdog.service 2>/dev/null; then
+            info "Service restarted with new priority order."
+            return 0
+        else
+            warn "Failed to restart via systemctl; falling back to direct signal."
+        fi
+    fi
+
+    # Fallback to direct process signaling (SIGHUP triggers instant pause/reload/reorder)
+    local pid
+    if pid=$(get_daemon_pid); then
+        info "Signaling running watchdog daemon (PID ${pid}) to pause and apply new order..."
+        kill -HUP "$pid" 2>/dev/null || true
+        kill -USR1 "$pid" 2>/dev/null || true
+        sleep 0.3
+        if kill -0 "$pid" 2>/dev/null; then
+            info "Daemon successfully reloaded with new priority order."
+        else
+            warn "Daemon exited upon signal; systemd should restart it."
+        fi
+    else
+        info "Daemon is not currently running. Priority saved; it will apply when the watchdog starts."
+    fi
+}
+
+# ---------------------------------------------------------
+# HARDWARE INTROSPECTION (FOR STATUS & SHOW)
+# ---------------------------------------------------------
+detect_interface_type() {
+    local iface="$1"
+    local syspath="/sys/class/net/${iface}"
+
+    if [[ ! -d "$syspath" ]]; then
+        echo "Other"
+        return 0
+    fi
+
+    if [[ -d "${syspath}/wireless" || -d "${syspath}/phy80211" ]]; then
+        echo "Wi-Fi"
+        return 0
+    fi
+
+    if [[ -d "${syspath}/device" ]]; then
+        local devlink
+        devlink=$(readlink -f "${syspath}/device" 2>/dev/null || echo "")
+
+        if [[ "$devlink" =~ /usb[0-9]+ ]]; then
+            echo "USB/Cell"
+            return 0
+        fi
+
+        local driverlink
+        driverlink=$(readlink -f "${syspath}/device/driver" 2>/dev/null || echo "")
+        local driver="${driverlink##*/}"
+        case "$driver" in
+            cdc_ether|rndis_host|cdc_ncm|qmi_wwan|cdc_mbim|huawei_cdc_ncm|rndis_wlan)
+                echo "USB/Cell"
+                return 0
+                ;;
+        esac
+
+        if [[ "$devlink" =~ /pci[0-9a-fA-F:]+ ]]; then
+            echo "LAN (PCI)"
+            return 0
+        fi
+    fi
+
+    echo "Other"
+}
+
+is_interface_carrier_up() {
+    local iface="$1"
+    local syspath="/sys/class/net/${iface}"
+    if [[ -d "$syspath" ]]; then
+        local operstate="down"
+        local carrier="0"
+        [[ -f "${syspath}/operstate" ]] && operstate=$(cat "${syspath}/operstate" 2>/dev/null || echo "down")
+        [[ -f "${syspath}/carrier" ]] && carrier=$(cat "${syspath}/carrier" 2>/dev/null || echo "0")
+        if [[ ("$operstate" == "up" || "$operstate" == "unknown") && "$carrier" == "1" ]]; then
+            return 0
+        fi
+        return 1
+    fi
+    local link_info
+    link_info=$(ip link show dev "$iface" 2>/dev/null || echo "")
+    if [[ -n "$link_info" && ! "$link_info" =~ NO-CARRIER && ("$link_info" =~ state\ UP || "$link_info" =~ LOWER_UP) ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------
+# PRIORITY CONFIGURATION I/O
+# ---------------------------------------------------------
+ensure_drop_in_dir() {
+    if [[ ! -d "$DROP_IN_DIR" ]]; then
+        if ! mkdir -p "$DROP_IN_DIR" 2>/dev/null; then
+            die "Cannot create ${DROP_IN_DIR}. Changing priority requires root privileges. Please run with sudo:\n  sudo net-failover-watchdog-ctl priority set ..."
+        fi
+    fi
+}
+
+load_effective_priorities() {
+    local -A type_weights=([LAN]=1 [USB]=2 [WIFI]=3 [OTHER]=4)
+    local -A iface_weights=()
+
+    if [[ -f "$MAIN_CONFIG" ]]; then
+        local w
+        w=$(grep -E '^\s*WEIGHT_LAN='  "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[LAN]="$WEIGHT_LAN" || true
+        w=$(grep -E '^\s*WEIGHT_USB='  "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[USB]="$WEIGHT_USB" || true
+        w=$(grep -E '^\s*WEIGHT_WIFI=' "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[WIFI]="$WEIGHT_WIFI" || true
+        w=$(grep -E '^\s*WEIGHT_OTHER=' "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[OTHER]="$WEIGHT_OTHER" || true
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ INTERFACE_WEIGHTS\[\"?([a-zA-Z0-9_-]+)\"?\]=([0-9]+) ]]; then
+                iface_weights["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            fi
+        done < <(grep -E '^\s*INTERFACE_WEIGHTS\[' "$MAIN_CONFIG" 2>/dev/null || true)
+    fi
+
+    if [[ -f "$PRIORITY_CONF" ]]; then
+        local w
+        w=$(grep -E '^\s*WEIGHT_LAN='  "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[LAN]="$WEIGHT_LAN" || true
+        w=$(grep -E '^\s*WEIGHT_USB='  "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[USB]="$WEIGHT_USB" || true
+        w=$(grep -E '^\s*WEIGHT_WIFI=' "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[WIFI]="$WEIGHT_WIFI" || true
+        w=$(grep -E '^\s*WEIGHT_OTHER=' "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[OTHER]="$WEIGHT_OTHER" || true
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ INTERFACE_WEIGHTS\[\"?([a-zA-Z0-9_-]+)\"?\]=([0-9]+) ]]; then
+                iface_weights["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            fi
+        done < <(grep -E '^\s*INTERFACE_WEIGHTS\[' "$PRIORITY_CONF" 2>/dev/null || true)
+    fi
+
+    echo "TYPE_WEIGHTS:"
+    for t in LAN USB WIFI OTHER; do
+        echo "  ${t}=${type_weights[$t]}"
+    done
+
+    if [[ ${#iface_weights[@]} -gt 0 ]]; then
+        echo "INTERFACE_OVERRIDES:"
+        for iface in "${!iface_weights[@]}"; do
+            echo "  ${iface}=${iface_weights[$iface]}"
+        done
+    fi
+}
+
+write_priority_conf() {
+    local content="$1"
+    ensure_drop_in_dir
+    if ! echo "$content" > "$PRIORITY_CONF" 2>/dev/null; then
+        die "Failed to write ${PRIORITY_CONF}. Updating priority requires root privileges. Please run with sudo:\n  sudo net-failover-watchdog-ctl priority set ..."
+    fi
+    chmod 644 "$PRIORITY_CONF"
+}
+
+# ---------------------------------------------------------
+# SUBCOMMANDS
+# ---------------------------------------------------------
+
+# ---- priority show ----
+cmd_priority_show() {
+    echo -e "${BOLD}Net Failover Watchdog — Priority Configuration${RESET}"
+    echo ""
+
+    local prio_data
+    prio_data=$(load_effective_priorities)
+
+    # Type priorities
+    echo -e "${CYAN}Hardware Type Priorities${RESET} ${DIM}(lower value = higher priority)${RESET}"
+    echo "  ┌──────────┬──────────┐"
+    echo "  │  Type    │  Weight  │"
+    echo "  ├──────────┼──────────┤"
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\ \ ([A-Z]+)=([0-9]+) ]]; then
+            local t="${BASH_REMATCH[1]}"
+            local w="${BASH_REMATCH[2]}"
+            printf "  │  %-7s │  %-7s │\n" "$t" "$w"
+        fi
+    done <<< "$(echo "$prio_data" | sed -n '/^TYPE_WEIGHTS:/,/^[A-Z]/p' | grep -E '^\s+[A-Z]')"
+    echo "  └──────────┴──────────┘"
+
+    # Interface overrides
+    local overrides
+    overrides=$(echo "$prio_data" | sed -n '/^INTERFACE_OVERRIDES:/,$ p' | grep -E '^\s+[a-zA-Z0-9]' || true)
+    if [[ -n "$overrides" ]]; then
+        echo ""
+        echo -e "${CYAN}Per-Interface Overrides${RESET}"
+        echo "  ┌──────────────────┬──────────┐"
+        echo "  │  Interface       │  Weight  │"
+        echo "  ├──────────────────┼──────────┤"
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\ \ ([a-zA-Z0-9_-]+)=([0-9]+) ]]; then
+                printf "  │  %-15s │  %-7s │\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+            fi
+        done <<< "$overrides"
+        echo "  └──────────────────┴──────────┘"
+    fi
+
+    # Discovered interfaces on this machine
+    echo ""
+    echo -e "${CYAN}Detected Hardware Interfaces${RESET}"
+    printf "  %-12s %-10s %-12s %-8s\n" "INTERFACE" "CARRIER" "DETECTED TYPE" "WEIGHT"
+    echo "  --------------------------------------------------"
+
+    local discovered_any=false
+    local iface_list=()
+    if [[ -d /sys/class/net ]]; then
+        for p in /sys/class/net/*; do
+            [[ ! -e "$p" ]] && continue
+            local ifname="${p##*/}"
+            [[ "$ifname" =~ ^(lo|docker|veth|virbr|tun|tap|wg|br-|podman) ]] && continue
+            iface_list+=("$ifname")
+        done
+    fi
+
+    # Also check ip link if namespace or sysfs not populated
+    if [[ ${#iface_list[@]} -eq 0 ]]; then
+        while IFS= read -r line; do
+            local ifname
+            ifname=$(echo "$line" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')
+            [[ -z "$ifname" || "$ifname" =~ ^(lo|docker|veth|virbr|tun|tap|wg|br-|podman) ]] && continue
+            iface_list+=("$ifname")
+        done < <(ip -o link show 2>/dev/null || true)
+    fi
+
+    for dev in "${iface_list[@]}"; do
+        discovered_any=true
+        local carrier="DOWN"
+        is_interface_carrier_up "$dev" && carrier="UP"
+        local devtype
+        devtype=$(detect_interface_type "$dev")
+
+        # Determine effective weight
+        local eff_weight=4
+        if echo "$overrides" | grep -q "  ${dev}="; then
+            eff_weight=$(echo "$overrides" | grep "  ${dev}=" | awk -F'=' '{print $2}')
+        else
+            case "$devtype" in
+                "LAN (PCI)")
+                    eff_weight=$(echo "$prio_data" | grep -E '^\s*LAN=' | awk -F'=' '{print $2}')
+                    ;;
+                "USB/Cell")
+                    eff_weight=$(echo "$prio_data" | grep -E '^\s*USB=' | awk -F'=' '{print $2}')
+                    ;;
+                "Wi-Fi")
+                    eff_weight=$(echo "$prio_data" | grep -E '^\s*WIFI=' | awk -F'=' '{print $2}')
+                    ;;
+                *)
+                    eff_weight=$(echo "$prio_data" | grep -E '^\s*OTHER=' | awk -F'=' '{print $2}')
+                    ;;
+            esac
+        fi
+        printf "  %-12s %-10s %-12s %-8s\n" "$dev" "$carrier" "$devtype" "$eff_weight"
+    done
+
+    if [[ "$discovered_any" == false ]]; then
+        echo "  (No physical uplinks detected)"
+    fi
+
+    # Source info & Daemon status
+    echo ""
+    if [[ -f "$PRIORITY_CONF" ]]; then
+        echo -e "${DIM}Active drop-in: ${PRIORITY_CONF}${RESET}"
+    else
+        echo -e "${DIM}Using base configuration: ${MAIN_CONFIG}${RESET}"
+    fi
+
+    echo ""
+    if is_systemd_service_active; then
+        echo -e "  Service (systemd): ${GREEN}active (running)${RESET}"
+    elif get_daemon_pid >/dev/null 2>&1; then
+        echo -e "  Daemon process:    ${GREEN}running (PID $(get_daemon_pid))${RESET}"
+    else
+        echo -e "  Service/Daemon:    ${RED}inactive / stopped${RESET}"
+    fi
+}
+
+# ---- priority set ----
+# Accepts multiple formats:
+#   lan>usb>wifi>other
+#   lan > usb > wifi > other
+#   lan,usb,wifi,other
+#   eth0>usb0>wlan0>eth1
+#   eth0=1 usb0=2 wlan0=3
+#   -i eth0=1 usb0=2
+cmd_priority_set() {
+    if [[ $# -eq 0 ]]; then
+        die "Usage: $0 priority set <order...>
+Examples:
+  $0 priority set lan > usb > wifi > other
+  $0 priority set lan>usb>wifi>other
+  $0 priority set eth0 > usb0 > enp3s0 > wlan0
+  $0 priority set eth0=1 usb0=2 enp3s0=3"
+    fi
+
+    local IFS=$' \t\n'
+    local tokens=()
+    for arg in "$@"; do
+        local clean
+        clean=$(echo "$arg" | tr '>,;' '   ')
+        for word in $clean; do
+            [[ -n "$word" ]] && tokens+=("$word")
+        done
+    done
+
+    if [[ ${#tokens[@]} -eq 0 ]]; then
+        die "No priority targets specified."
+    fi
+
+    # Check for --interface or -i flag
+    local explicit_iface_mode=false
+    local cleaned_tokens=()
+    for tok in "${tokens[@]}"; do
+        if [[ "$tok" == "--interface" || "$tok" == "-i" ]]; then
+            explicit_iface_mode=true
+        else
+            cleaned_tokens+=("$tok")
+        fi
+    done
+    tokens=("${cleaned_tokens[@]}")
+
+    # Determine mode: type-based vs interface-based
+    # If any token is "lan", "usb", "wifi", "other" and none contains '=', we check if ALL are types
+    local valid_types=("lan" "usb" "wifi" "other")
+    local mode="interface"
+
+    local all_types=true
+    for tok in "${tokens[@]}"; do
+        local lower="${tok,,}"
+        local match=false
+        for vt in "${valid_types[@]}"; do
+            if [[ "$lower" == "$vt" ]]; then
+                match=true
+                break
+            fi
+        done
+        if [[ "$match" == false ]]; then
+            all_types=false
+            break
+        fi
+    done
+
+    if [[ "$all_types" == true && "$explicit_iface_mode" == false ]]; then
+        mode="type"
+    fi
+
+    local conf_lines=()
+    conf_lines+=("# Net Failover Watchdog Priority Configuration")
+    conf_lines+=("# Generated via net-failover-watchdog-ctl on $(date -Iseconds)")
+    conf_lines+=("")
+
+    if [[ "$mode" == "type" ]]; then
+        local weight=1
+        for tok in "${tokens[@]}"; do
+            local upper="${tok^^}"
+            conf_lines+=("WEIGHT_${upper}=${weight}")
+            (( weight++ ))
+        done
+
+        # Fill any remaining unspecified types with incrementing weights
+        for vt in "${valid_types[@]}"; do
+            local upper="${vt^^}"
+            local exists=false
+            for line in "${conf_lines[@]}"; do
+                if [[ "$line" == "WEIGHT_${upper}="* ]]; then
+                    exists=true
+                    break
+                fi
+            done
+            if [[ "$exists" == false ]]; then
+                conf_lines+=("WEIGHT_${upper}=${weight}")
+                (( weight++ ))
+            fi
+        done
+
+    elif [[ "$mode" == "interface" ]]; then
+        conf_lines+=("# Explicit Per-Interface Weight Overrides (Lower = Higher Preference)")
+        local weight=1
+        for tok in "${tokens[@]}"; do
+            if [[ "$tok" =~ ^([a-zA-Z0-9_.-]+)=([0-9]+)$ ]]; then
+                local iface="${BASH_REMATCH[1]}"
+                local w="${BASH_REMATCH[2]}"
+                conf_lines+=("INTERFACE_WEIGHTS[\"${iface}\"]=${w}")
+            elif [[ "$tok" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+                # Sequential positional interface ordering: eth0 > usb0 > wlan0
+                conf_lines+=("INTERFACE_WEIGHTS[\"${tok}\"]=${weight}")
+                (( weight++ ))
+            else
+                die "Invalid interface specification: '${tok}'. Expected <name> or <name>=<weight>."
+            fi
+        done
+    fi
+
+    conf_lines+=("")
+
+    local content
+    content=$(printf '%s\n' "${conf_lines[@]}")
+
+    echo -e "${BOLD}Applying new priority configuration:${RESET}"
+    echo ""
+    echo "$content" | grep -v '^#' | grep -v '^$' | while IFS= read -r line; do
+        echo -e "  ${CYAN}${line}${RESET}"
+    done
+    echo ""
+
+    write_priority_conf "$content"
+    info "Saved to ${PRIORITY_CONF}"
+
+    # Pause and restart daemon with new order
+    apply_new_order
+}
+
+# ---- priority reset ----
+cmd_priority_reset() {
+    if [[ -f "$PRIORITY_CONF" ]]; then
+        if ! rm -f "$PRIORITY_CONF" 2>/dev/null; then
+            die "Cannot remove ${PRIORITY_CONF}. Resetting priority requires root privileges. Please run with sudo:\n  sudo net-failover-watchdog-ctl priority reset"
+        fi
+        info "Removed ${PRIORITY_CONF}. Reverted to default priority in ${MAIN_CONFIG}."
+        apply_new_order
+    else
+        info "No priority overrides active. Already using default configuration."
+    fi
+}
+
+# ---- reload ----
+cmd_reload() {
+    apply_new_order
+}
+
+# ---- restart ----
+cmd_restart() {
+    apply_new_order
+}
+
+# ---- status ----
+cmd_status() {
+    if command -v "$DAEMON_BIN" >/dev/null 2>&1; then
+        exec "$DAEMON_BIN" --status
+    else
+        exec /usr/bin/"$DAEMON_BIN" --status
+    fi
+}
+
+# ---------------------------------------------------------
+# HELP & USAGE
+# ---------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: net-failover-watchdog-ctl <command> [arguments...]
+
+Commands:
+  priority show                         Display current priority hierarchy & detected interfaces
+  priority set <order...>               Configure priority hierarchy (types or interfaces)
+  priority reset                        Remove overrides and revert to base configuration
+  reload                                Trigger daemon configuration reload
+  restart                               Pause and restart daemon with active configuration
+  status                                Show real-time interface metrics and health status
+
+Priority Configuration Examples:
+  # Set hardware type hierarchy (LAN > USB Tethering > Wi-Fi > Other):
+    sudo net-failover-watchdog-ctl priority set lan > usb > wifi > other
+    sudo net-failover-watchdog-ctl priority set lan>usb>wifi>other
+    sudo net-failover-watchdog-ctl priority set usb > lan > wifi > other
+
+  # Set specific interface order (when multiple LANs/USBs/Wi-Fis exist):
+    sudo net-failover-watchdog-ctl priority set eth0 > usb0 > enp3s0 > wlan0
+    sudo net-failover-watchdog-ctl priority set eth0=1 usb0=2 enp3s0=3 wlan0=4
+
+  # Revert back to defaults:
+    sudo net-failover-watchdog-ctl priority reset
+
+When priority changes are applied, the control tool writes to
+/etc/net-failover-watchdog.d/priority.conf and immediately pauses/restarts
+the watchdog daemon with the new priority order.
+
+Options:
+  -v, --version    Show version information
+  -h, --help       Show this help manual
+
+EOF
+}
+
+# ---------------------------------------------------------
+# MAIN DISPATCH
+# ---------------------------------------------------------
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+
+    case "$1" in
+        priority)
+            shift
+            if [[ $# -eq 0 ]]; then
+                cmd_priority_show
+                exit 0
+            fi
+            case "$1" in
+                show|list) cmd_priority_show ;;
+                set)       shift; cmd_priority_set "$@" ;;
+                reset)     cmd_priority_reset ;;
+                *)         die "Unknown priority subcommand: '$1'. Valid: show, set, reset." ;;
+            esac
+            ;;
+        reload)
+            cmd_reload
+            ;;
+        restart)
+            cmd_restart
+            ;;
+        status)
+            cmd_status
+            ;;
+        -v|--version)
+            echo "net-failover-watchdog-ctl v${CTL_VERSION}"
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            die "Unknown command: '$1'. Run '$0 --help' for usage."
+            ;;
+    esac
+}
+
+main "$@"

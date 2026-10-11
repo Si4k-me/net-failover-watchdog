@@ -1,0 +1,958 @@
+#!/usr/bin/env bash
+#
+# net-failover-watchdog
+# Health-aware Linux network failover daemon with configurable interface priorities,
+# hysteresis, IPv4 route management and connectivity verification.
+#
+# Author: Akshit Kamboj
+# License: MIT
+#
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="1.0.0"
+
+# ---------------------------------------------------------
+# DEFAULT CONFIGURATION VALUES
+# ---------------------------------------------------------
+CONFIG_FILE="${CONFIG_FILE:-/etc/net-failover-watchdog.conf}"
+DROP_IN_DIR="${DROP_IN_DIR:-/etc/net-failover-watchdog.d}"
+
+# Flag set by SIGHUP handler to trigger config reload in the main loop
+FLAG_RELOAD=false
+FLAG_FORCE_REORDER=false
+
+CHECK_INTERVAL=3
+
+# Multi-provider Anycast DNS targets for Layer 3 validation
+L3_TARGETS=("1.1.1.1" "8.8.8.8" "9.9.9.9" "208.67.222.222")
+L3_QUORUM=2
+L3_TIMEOUT=1
+
+# Layer 7 validation endpoints (Captive Portal & Egress Verification)
+L7_CHECK_ENABLED=true
+L7_URL_GOOGLE="http://connectivitycheck.gstatic.com/generate_204"
+L7_URL_CLOUDFLARE="http://cp.cloudflare.com/generate_204"
+L7_URL_MSFT="http://www.msftconnecttest.com/connecttest.txt"
+L7_MSFT_EXPECTED="Microsoft Connect Test"
+L7_TIMEOUT=2
+
+# Routing Metric Hierarchy
+METRIC_PRIMARY=50
+METRIC_BACKUP=200
+METRIC_DEGRADED=500
+
+# Hysteresis Threshold Limits (in execution cycles)
+THRESHOLD_FAIL=3       # Trigger failover after 3 consecutive failures (~9s)
+THRESHOLD_RECOVERY=10  # Require 10 consecutive successes to recover (~30s)
+
+# Hardware Interface Hierarchy Weights (Lower value denotes higher preference)
+WEIGHT_LAN=1
+WEIGHT_USB=2
+WEIGHT_WIFI=3
+WEIGHT_OTHER=4
+
+# Interface Selection
+MANAGED_INTERFACES="auto"
+IGNORED_INTERFACES=("lo" "docker*" "veth*" "virbr*" "tun*" "tap*" "wg*" "br-*" "podman*" "vmnet*" "vboxnet*")
+declare -g -A INTERFACE_WEIGHTS=()
+
+# System Daemon Synchronization
+DNS_SYNC_ENABLED=true
+
+# Kernel Sysctl Handling (Default: false, explicit opt-in only)
+AUTO_CONFIG_RP_FILTER=false
+
+# Paths and Logging
+STATE_DIR="/run/net-failover-watchdog"
+LOCK_FILE="/run/lock/net-failover-watchdog.lock"
+LOG_LEVEL="INFO"
+
+# Runtime Execution Flags
+FLAG_ONCE=false
+FLAG_DRY_RUN=false
+FLAG_STATUS=false
+
+# ---------------------------------------------------------
+# LOGGING AND OUTPUT HELPERS
+# ---------------------------------------------------------
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+
+    case "$LOG_LEVEL" in
+        "DEBUG") ;;
+        "INFO")
+            [[ "$level" == "DEBUG" ]] && return 0
+            ;;
+        "WARN"|"WARNING")
+            [[ "$level" == "DEBUG" || "$level" == "INFO" ]] && return 0
+            ;;
+        "ERROR"|"FATAL")
+            [[ "$level" != "ERROR" && "$level" != "FATAL" ]] && return 0
+            ;;
+    esac
+
+    echo "[$timestamp] [$level] $msg"
+}
+
+log_debug() { log "DEBUG" "$@"; }
+log_info()  { log "INFO"  "$@"; }
+log_warn()  { log "WARN"  "$@"; }
+log_error() { log "ERROR" "$@"; }
+
+# ---------------------------------------------------------
+# CLI ARGUMENT PARSING
+# ---------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: net-failover-watchdog [OPTIONS]
+
+Health-aware Linux network failover daemon with configurable interface
+priorities, hysteresis, IPv4 route management, and connectivity verification.
+
+Options:
+  -c, --config FILE    Path to configuration file (default: /etc/net-failover-watchdog.conf)
+  -1, --once           Execute a single monitoring and route reconciliation pass, then exit
+  -s, --status         Display operational interface state, metrics, and health, then exit
+  -d, --dry-run        Evaluate link health and calculate route changes without altering FIB or DNS
+  -v, --version        Display version information and exit
+  -h, --help           Display this help message and exit
+
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            -1|--once)
+                FLAG_ONCE=true
+                shift
+                ;;
+            -s|--status)
+                FLAG_STATUS=true
+                shift
+                ;;
+            -d|--dry-run)
+                FLAG_DRY_RUN=true
+                shift
+                ;;
+            -v|--version)
+                echo "net-failover-watchdog v${VERSION}"
+                exit 0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+parse_args "$@"
+
+# ---------------------------------------------------------
+# CONFIGURATION INGESTION
+# ---------------------------------------------------------
+# Load main config and any drop-in overrides.
+# Sourcing in global file scope so declare and array assignments are not local.
+load_configuration() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log_debug "Loading configuration from ${CONFIG_FILE}"
+        # Transform any declare without -g into declare -g to ensure global scope
+        # shellcheck source=/dev/null
+        source <(sed -E 's/^[[:space:]]*declare -A/declare -g -A/' "$CONFIG_FILE")
+    else
+        log_debug "Configuration file ${CONFIG_FILE} not found; using internal defaults"
+    fi
+
+    # Load drop-in overrides (e.g. /etc/net-failover-watchdog.d/priority.conf)
+    if [[ -d "$DROP_IN_DIR" ]]; then
+        local drop_in
+        for drop_in in "${DROP_IN_DIR}"/*.conf; do
+            [[ ! -f "$drop_in" ]] && continue
+            log_debug "Loading drop-in configuration: ${drop_in}"
+            # shellcheck source=/dev/null
+            source <(sed -E 's/^[[:space:]]*declare -A/declare -g -A/' "$drop_in")
+        done
+    fi
+}
+
+load_configuration
+
+# SIGHUP handler: reload configuration at runtime
+handle_sighup() {
+    FLAG_RELOAD=true
+}
+
+perform_reload() {
+    log_info "Reloading configuration (SIGHUP received)..."
+    load_configuration
+    FLAG_RELOAD=false
+    FLAG_FORCE_REORDER=true
+    log_info "Configuration reloaded. New weights: LAN=${WEIGHT_LAN} USB=${WEIGHT_USB} WIFI=${WEIGHT_WIFI} OTHER=${WEIGHT_OTHER}"
+}
+
+# ---------------------------------------------------------
+# PROCESS CONCURRENCY AND CLEANUP TRAPS
+# ---------------------------------------------------------
+setup_environment() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+    if [[ "$FLAG_STATUS" == false && "$FLAG_DRY_RUN" == false ]]; then
+        local lock_dir
+        lock_dir="$(dirname "$LOCK_FILE")"
+        mkdir -p "$lock_dir" 2>/dev/null || true
+
+        exec 200>"$LOCK_FILE"
+        if ! flock -n 200; then
+            log_error "Another watchdog process holds the lockfile ($LOCK_FILE). Exiting."
+            exit 1
+        fi
+    fi
+}
+
+cleanup() {
+    local exit_code=$?
+    if [[ "$FLAG_STATUS" == false && "$FLAG_DRY_RUN" == false ]]; then
+        log_info "Watchdog shutting down (signal intercepted)."
+    fi
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
+trap handle_sighup HUP USR1
+
+# ---------------------------------------------------------
+# HARDWARE INTROSPECTION & CLASSIFICATION
+# ---------------------------------------------------------
+classify_interface() {
+    local iface="$1"
+    [[ -z "$iface" ]] && { echo "$WEIGHT_OTHER"; return 0; }
+
+    # User configured weight overrides
+    if [[ -n "${INTERFACE_WEIGHTS[$iface]:-}" ]]; then
+        echo "${INTERFACE_WEIGHTS[$iface]}"
+        return 0
+    fi
+
+    local syspath="/sys/class/net/${iface}"
+    if [[ ! -d "$syspath" ]]; then
+        echo "$WEIGHT_OTHER"
+        return 0
+    fi
+
+    # 802.11 Wireless Architecture
+    if [[ -d "${syspath}/wireless" || -d "${syspath}/phy80211" ]]; then
+        echo "$WEIGHT_WIFI"
+        return 0
+    fi
+
+    # Hardware Bus Topology
+    if [[ -d "${syspath}/device" ]]; then
+        local devlink
+        devlink=$(readlink -f "${syspath}/device" 2>/dev/null || echo "")
+
+        # USB Bus (Cellular Dongles, LTE Modems, Phone Tethering)
+        if [[ "$devlink" =~ /usb[0-9]+ ]]; then
+            echo "$WEIGHT_USB"
+            return 0
+        fi
+
+        # Check Kernel Driver Binding
+        local driverlink
+        driverlink=$(readlink -f "${syspath}/device/driver" 2>/dev/null || echo "")
+        local driver="${driverlink##*/}"
+        case "$driver" in
+            cdc_ether|rndis_host|cdc_ncm|qmi_wwan|cdc_mbim|huawei_cdc_ncm|rndis_wlan)
+                echo "$WEIGHT_USB"
+                return 0
+                ;;
+        esac
+
+        # Physical PCI / PCIe / Onboard Ethernet Controllers
+        if [[ "$devlink" =~ /pci[0-9a-fA-F:]+ ]]; then
+            echo "$WEIGHT_LAN"
+            return 0
+        fi
+    fi
+
+    echo "$WEIGHT_OTHER"
+}
+
+is_interface_carrier_up() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 1
+
+    local syspath="/sys/class/net/${iface}"
+    if [[ -d "$syspath" ]]; then
+        local operstate="down"
+        local carrier="0"
+
+        [[ -f "${syspath}/operstate" ]] && operstate=$(cat "${syspath}/operstate" 2>/dev/null || echo "down")
+        [[ -f "${syspath}/carrier" ]] && carrier=$(cat "${syspath}/carrier" 2>/dev/null || echo "0")
+
+        # Some wireless/CDC drivers report operstate as 'unknown' when carrier is 1
+        if [[ ("$operstate" == "up" || "$operstate" == "unknown") && "$carrier" == "1" ]]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    # Fallback when /sys/class/net is not available (e.g. network namespaces / containers)
+    local link_info
+    link_info=$(ip link show dev "$iface" 2>/dev/null || echo "")
+    if [[ -n "$link_info" && ! "$link_info" =~ NO-CARRIER && ("$link_info" =~ state\ UP || "$link_info" =~ LOWER_UP) ]]; then
+        return 0
+    fi
+    return 1
+}
+
+has_ipv4_address() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 1
+    ip -4 addr show dev "$iface" 2>/dev/null | grep -q "inet "
+}
+
+get_interface_gateway() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 1
+
+    local route_line
+    route_line=$(ip -4 route show default dev "$iface" 2>/dev/null | head -n 1 || true)
+    [[ -z "$route_line" ]] && return 1
+
+    if [[ "$route_line" =~ via\ ([0-9a-fA-F.:]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # Device-only route (point-to-point or link-scoped without via)
+    if [[ "$route_line" =~ ^default ]]; then
+        echo "dev"
+        return 0
+    fi
+
+    return 1
+}
+
+is_ignored_interface() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 0
+    for pattern in "${IGNORED_INTERFACES[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$iface" == $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+discover_interfaces() {
+    local candidates=()
+
+    if [[ "$MANAGED_INTERFACES" != "auto" && ${#MANAGED_INTERFACES[@]} -gt 0 ]]; then
+        for iface in "${MANAGED_INTERFACES[@]}"; do
+            [[ -z "$iface" ]] && continue
+            if [[ -d "/sys/class/net/${iface}" ]] || ip link show dev "$iface" >/dev/null 2>&1; then
+                candidates+=("$iface")
+            fi
+        done
+    else
+        # Auto-discovery
+        local sys_ifaces=()
+        if [[ -d /sys/class/net ]]; then
+            for devpath in /sys/class/net/*; do
+                [[ ! -e "$devpath" ]] && continue
+                local devname="${devpath##*/}"
+                [[ -z "$devname" ]] && continue
+                is_ignored_interface "$devname" && continue
+
+                if ip -4 route show default dev "$devname" 2>/dev/null | grep -q "^default"; then
+                    sys_ifaces+=("$devname")
+                elif is_interface_carrier_up "$devname" && has_ipv4_address "$devname"; then
+                    sys_ifaces+=("$devname")
+                fi
+            done
+        fi
+
+        # Also inspect ip link for namespaces/containers
+        while IFS= read -r line; do
+            local ifname
+            ifname=$(echo "$line" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')
+            [[ -z "$ifname" ]] && continue
+            is_ignored_interface "$ifname" && continue
+            if ip -4 route show default dev "$ifname" 2>/dev/null | grep -q "^default"; then
+                sys_ifaces+=("$ifname")
+            elif is_interface_carrier_up "$ifname" && has_ipv4_address "$ifname"; then
+                sys_ifaces+=("$ifname")
+            fi
+        done < <(ip -o link show 2>/dev/null || true)
+
+        # Deduplicate
+        if [[ ${#sys_ifaces[@]} -gt 0 ]]; then
+            IFS=$'\n' read -d '' -r -a candidates < <(printf '%s\n' "${sys_ifaces[@]}" | sort -u && printf '\0') || true
+        fi
+    fi
+
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+        printf '%s\n' "${candidates[@]}"
+    fi
+}
+
+# ---------------------------------------------------------
+# KERNEL SYSCTL & REVERSE PATH FILTERING INSPECTION
+# ---------------------------------------------------------
+check_and_handle_rp_filter() {
+    local iface="$1"
+    local all_rp=0
+    local dev_rp=0
+
+    [[ -f /proc/sys/net/ipv4/conf/all/rp_filter ]] && all_rp=$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0)
+    [[ -f "/proc/sys/net/ipv4/conf/${iface}/rp_filter" ]] && dev_rp=$(cat "/proc/sys/net/ipv4/conf/${iface}/rp_filter" 2>/dev/null || echo 0)
+
+    # In Linux kernel, effective rp_filter is max(all, dev)
+    local effective_rp=$dev_rp
+    [[ "$all_rp" -gt "$dev_rp" ]] && effective_rp=$all_rp
+
+    if [[ "$effective_rp" -eq 1 ]]; then
+        if [[ "$AUTO_CONFIG_RP_FILTER" == true ]]; then
+            log_info "Configuring loose rp_filter (mode 2) for managed interface ${iface}"
+            if [[ "$FLAG_DRY_RUN" == false ]]; then
+                sysctl -w "net.ipv4.conf.${iface}.rp_filter=2" >/dev/null 2>&1 || true
+            fi
+        else
+            local warned_file="${STATE_DIR}/${iface}.rp_warned"
+            if [[ ! -f "$warned_file" ]]; then
+                log_warn "Interface ${iface} operates under Strict Reverse Path Filtering (rp_filter=1). Inbound health probe replies on secondary links may be dropped by the kernel. Enable loose mode (rp_filter=2) via sysctl or set AUTO_CONFIG_RP_FILTER=true in /etc/net-failover-watchdog.conf."
+                mkdir -p "$STATE_DIR" 2>/dev/null || true
+                touch "$warned_file" 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+
+# ---------------------------------------------------------
+# ASYNCHRONOUS HEALTH VALIDATION ENGINE
+# ---------------------------------------------------------
+probe_l3_quorum() {
+    local iface="$1"
+    local success_count=0
+    local pids=()
+
+    for target in "${L3_TARGETS[@]}"; do
+        (
+            if ping -c 1 -W "$L3_TIMEOUT" -I "$iface" "$target" >/dev/null 2>&1; then
+                exit 0
+            else
+                exit 1
+            fi
+        ) &
+        pids+=($!)
+    done
+
+    for pid in "${pids[@]}"; do
+        if wait "$pid"; then
+            (( success_count += 1 ))
+        fi
+    done
+
+    log_debug "Interface ${iface} L3 quorum: ${success_count}/${#L3_TARGETS[@]} responded (required: ${L3_QUORUM})"
+    if [[ "$success_count" -ge "$L3_QUORUM" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+probe_l7_captive_portal() {
+    local iface="$1"
+
+    [[ "$L7_CHECK_ENABLED" != true ]] && return 0
+
+    # Stage 1: Google generate_204 endpoint validation
+    local http_code
+    http_code=$(curl --interface "$iface" \
+                     --silent \
+                     --max-time "$L7_TIMEOUT" \
+                     --connect-timeout "$L7_TIMEOUT" \
+                     --output /dev/null \
+                     --write-out "%{http_code}" \
+                     "$L7_URL_GOOGLE" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" == "204" ]]; then
+        log_debug "Interface ${iface} passed L7 Google 204 check"
+        return 0
+    fi
+
+    # Stage 2: Cloudflare generate_204 endpoint validation
+    http_code=$(curl --interface "$iface" \
+                     --silent \
+                     --max-time "$L7_TIMEOUT" \
+                     --connect-timeout "$L7_TIMEOUT" \
+                     --output /dev/null \
+                     --write-out "%{http_code}" \
+                     "$L7_URL_CLOUDFLARE" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" == "204" ]]; then
+        log_debug "Interface ${iface} passed L7 Cloudflare 204 check"
+        return 0
+    fi
+
+    # Stage 3: Microsoft NCSI plain-text validation
+    local msft_body
+    msft_body=$(curl --interface "$iface" \
+                     --silent \
+                     --max-time "$L7_TIMEOUT" \
+                     --connect-timeout "$L7_TIMEOUT" \
+                     "$L7_URL_MSFT" 2>/dev/null || echo "")
+
+    if [[ "$msft_body" == *"$L7_MSFT_EXPECTED"* ]]; then
+        log_debug "Interface ${iface} passed L7 Microsoft NCSI check"
+        return 0
+    fi
+
+    log_warn "Interface ${iface} failed Layer 7 egress checks (possible captive portal or proxy block)"
+    return 1
+}
+
+evaluate_interface_health() {
+    local iface="$1"
+
+    if ! is_interface_carrier_up "$iface"; then
+        log_debug "Interface ${iface} has no physical carrier"
+        return 1
+    fi
+
+    check_and_handle_rp_filter "$iface"
+
+    if ! probe_l3_quorum "$iface"; then
+        log_debug "Interface ${iface} failed Layer 3 quorum"
+        return 1
+    fi
+
+    if ! probe_l7_captive_portal "$iface"; then
+        log_debug "Interface ${iface} failed Layer 7 check"
+        return 1
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------
+# HYSTERESIS TRACKING
+# ---------------------------------------------------------
+get_consecutive_failures() {
+    local iface="$1"
+    local file="${STATE_DIR}/${iface}.fails"
+    [[ -f "$file" ]] && cat "$file" || echo "0"
+}
+
+get_consecutive_successes() {
+    local iface="$1"
+    local file="${STATE_DIR}/${iface}.successes"
+    [[ -f "$file" ]] && cat "$file" || echo "0"
+}
+
+record_health_outcome() {
+    local iface="$1"
+    local status="$2"
+
+    local fails
+    fails=$(get_consecutive_failures "$iface")
+    local successes
+    successes=$(get_consecutive_successes "$iface")
+
+    if [[ "$status" -eq 0 ]]; then
+        (( successes += 1 ))
+        fails=0
+    else
+        (( fails += 1 ))
+        successes=0
+    fi
+
+    if [[ "$FLAG_DRY_RUN" == false ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        echo "$fails" > "${STATE_DIR}/${iface}.fails"
+        echo "$successes" > "${STATE_DIR}/${iface}.successes"
+    fi
+}
+
+# ---------------------------------------------------------
+# SYSTEMD-RESOLVED DNS SYNCHRONIZATION
+# ---------------------------------------------------------
+sync_dns_resolver() {
+    local primary_iface="$1"
+    local all_ifaces=("${@:2}")
+
+    [[ "$DNS_SYNC_ENABLED" != true ]] && return 0
+    [[ "$FLAG_DRY_RUN" == true ]] && return 0
+
+    if command -v resolvectl >/dev/null 2>&1; then
+        # Ensure systemd-resolved is active
+        if ! resolvectl status >/dev/null 2>&1; then
+            return 0
+        fi
+
+        for iface in "${all_ifaces[@]}"; do
+            if [[ "$iface" == "$primary_iface" ]]; then
+                resolvectl default-route "$iface" yes 2>/dev/null || true
+            else
+                resolvectl default-route "$iface" no 2>/dev/null || true
+            fi
+        done
+        resolvectl flush-caches 2>/dev/null || true
+        log_debug "Synchronized systemd-resolved DNS routing domains (primary: ${primary_iface})"
+    fi
+}
+
+# ---------------------------------------------------------
+# ATOMIC FORWARDING INFORMATION BASE RECONCILIATION
+# ---------------------------------------------------------
+reconcile_interface_route() {
+    local iface="$1"
+    local gateway="$2"
+    local target_metric="$3"
+
+    local current_routes
+    current_routes=$(ip -4 route show default dev "$iface" 2>/dev/null || true)
+
+    local target_found=false
+    local stale_routes=()
+
+    while IFS= read -r route_line; do
+        [[ -z "$route_line" ]] && continue
+
+        # Extract metric from route entry
+        local r_metric="0"
+        if [[ "$route_line" =~ metric\ ([0-9]+) ]]; then
+            r_metric="${BASH_REMATCH[1]}"
+        fi
+
+        # Check if route exactly matches our desired gateway and target metric
+        local is_exact_match=false
+        if [[ "$r_metric" -eq "$target_metric" ]]; then
+            if [[ "$gateway" == "dev" || -z "$gateway" ]]; then
+                if [[ ! "$route_line" =~ via\  ]]; then
+                    is_exact_match=true
+                fi
+            else
+                if [[ "$route_line" =~ via\ ${gateway}(\ |$) ]]; then
+                    is_exact_match=true
+                fi
+            fi
+        fi
+
+        if [[ "$is_exact_match" == true && "$target_found" == false ]]; then
+            target_found=true
+        else
+            stale_routes+=("$route_line")
+        fi
+    done <<< "$current_routes"
+
+    # Install desired target route if not present
+    if [[ "$target_found" == false ]]; then
+        log_info "Applying default route on dev ${iface} via ${gateway} metric ${target_metric}"
+        if [[ "$FLAG_DRY_RUN" == false ]]; then
+            if [[ "$gateway" == "dev" || -z "$gateway" ]]; then
+                ip -4 route add default dev "$iface" metric "$target_metric" 2>/dev/null || \
+                ip -4 route replace default dev "$iface" metric "$target_metric" 2>/dev/null || true
+            else
+                ip -4 route add default via "$gateway" dev "$iface" metric "$target_metric" 2>/dev/null || \
+                ip -4 route replace default via "$gateway" dev "$iface" metric "$target_metric" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Purge rogue/stale/duplicate routes (e.g. DHCP renewals, unmetered defaults)
+    for stale in "${stale_routes[@]}"; do
+        log_info "Pruning stale default route on dev ${iface}: ${stale}"
+        if [[ "$FLAG_DRY_RUN" == false ]]; then
+            # Construct precise route deletion command
+            # ip -4 route del accepts the raw route line or structured fields
+            local del_metric=""
+            local del_gw=""
+            if [[ "$stale" =~ metric\ ([0-9]+) ]]; then
+                del_metric="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$stale" =~ via\ ([0-9a-fA-F.:]+) ]]; then
+                del_gw="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -n "$del_gw" && -n "$del_metric" ]]; then
+                ip -4 route del default via "$del_gw" dev "$iface" metric "$del_metric" 2>/dev/null || true
+            elif [[ -n "$del_gw" ]]; then
+                ip -4 route del default via "$del_gw" dev "$iface" 2>/dev/null || true
+            elif [[ -n "$del_metric" ]]; then
+                ip -4 route del default dev "$iface" metric "$del_metric" 2>/dev/null || true
+            else
+                ip -4 route del default dev "$iface" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+# ---------------------------------------------------------
+# STATUS QUERY MODE (-s, --status)
+# ---------------------------------------------------------
+show_status() {
+    mapfile -t active_interfaces < <(discover_interfaces)
+
+    echo "=== net-failover-watchdog Interface Status ==="
+    printf "%-12s %-8s %-10s %-16s %-8s %-8s %-10s\n" \
+           "INTERFACE" "CARRIER" "TYPE" "GATEWAY" "METRIC" "FAILS" "SUCCESSES"
+    echo "----------------------------------------------------------------------------"
+
+    if [[ ${#active_interfaces[@]} -eq 0 ]]; then
+        echo "No operational network interfaces discovered."
+        return 0
+    fi
+
+    for iface in "${active_interfaces[@]}"; do
+        local carrier="DOWN"
+        is_interface_carrier_up "$iface" && carrier="UP"
+
+        local weight
+        weight=$(classify_interface "$iface")
+        local type="Other"
+        case "$weight" in
+            "$WEIGHT_LAN") type="LAN (PCI)" ;;
+            "$WEIGHT_USB") type="USB/Cell" ;;
+            "$WEIGHT_WIFI") type="Wi-Fi" ;;
+        esac
+
+        local gw
+        gw=$(get_interface_gateway "$iface" 2>/dev/null || echo "None")
+
+        local metric="None"
+        local route_line
+        route_line=$(ip -4 route show default dev "$iface" 2>/dev/null | head -n 1 || true)
+        if [[ "$route_line" =~ metric\ ([0-9]+) ]]; then
+            metric="${BASH_REMATCH[1]}"
+        elif [[ -n "$route_line" ]]; then
+            metric="0 (unmetered)"
+        fi
+
+        local fails
+        fails=$(get_consecutive_failures "$iface")
+        local successes
+        successes=$(get_consecutive_successes "$iface")
+
+        printf "%-12s %-8s %-10s %-16s %-8s %-8s %-10s\n" \
+               "$iface" "$carrier" "$type" "$gw" "$metric" "$fails" "$successes"
+    done
+    echo "=============================================="
+}
+
+# ---------------------------------------------------------
+# CORE DECISION AND CONTROL CYCLE
+# ---------------------------------------------------------
+run_watchdog_cycle() {
+    local raw_interfaces=()
+    mapfile -t raw_interfaces < <(discover_interfaces)
+
+    local active_interfaces=()
+    for dev in "${raw_interfaces[@]}"; do
+        [[ -n "$dev" ]] && active_interfaces+=("$dev")
+    done
+
+    if [[ ${#active_interfaces[@]} -eq 0 ]]; then
+        log_info "No active network interfaces detected in kernel table. Waiting..."
+        return 0
+    fi
+
+    # Score and sort candidates deterministically by hierarchy weight
+    local scored_candidates=()
+    for iface in "${active_interfaces[@]}"; do
+        [[ -z "$iface" ]] && continue
+        local weight
+        weight=$(classify_interface "$iface")
+        scored_candidates+=("${weight}:${iface}")
+    done
+
+    local sorted_candidates=()
+    IFS=$'\n' read -d '' -r -a sorted_candidates < <(printf '%s\n' "${scored_candidates[@]}" | sort -n && printf '\0') || true
+
+    local candidate_ifaces=()
+    local gateways=()
+    declare -A health_map=()
+
+    for entry in "${sorted_candidates[@]}"; do
+        [[ -z "$entry" ]] && continue
+        local iface="${entry#*:}"
+        candidate_ifaces+=("$iface")
+
+        local gw
+        gw=$(get_interface_gateway "$iface" 2>/dev/null || echo "")
+        gateways+=("$gw")
+
+        if [[ -z "$gw" ]]; then
+            health_map["$iface"]=1
+            record_health_outcome "$iface" 1
+            log_debug "Interface ${iface} has no gateway; marked unhealthy"
+            continue
+        fi
+
+        if evaluate_interface_health "$iface"; then
+            health_map["$iface"]=0
+            record_health_outcome "$iface" 0
+            log_debug "Interface ${iface} evaluated healthy"
+        else
+            health_map["$iface"]=1
+            record_health_outcome "$iface" 1
+            log_debug "Interface ${iface} evaluated unhealthy"
+        fi
+    done
+
+    # Identify current primary interface (metric 50)
+    local current_primary=""
+    current_primary=$(ip -4 route show default 2>/dev/null | awk '$0 ~ /metric 50/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+
+    local target_primary=""
+
+    # 0. Check if a manual reload / reorder was requested via CLI / SIGHUP
+    if [[ "$FLAG_FORCE_REORDER" == true ]]; then
+        for iface in "${candidate_ifaces[@]}"; do
+            if [[ "${health_map[$iface]}" -eq 0 ]]; then
+                target_primary="$iface"
+                log_info "Priority reordered: Promoting highest-priority healthy interface ${iface} (metric ${METRIC_PRIMARY})"
+                break
+            fi
+        done
+        FLAG_FORCE_REORDER=false
+    fi
+
+    # 1. Check if a HIGHER-PRIORITY candidate than current_primary has recovered
+    if [[ -z "$target_primary" ]]; then
+        local current_primary_weight=999
+        if [[ -n "$current_primary" ]]; then
+            current_primary_weight=$(classify_interface "$current_primary")
+        fi
+
+        for iface in "${candidate_ifaces[@]}"; do
+            local iface_weight
+            iface_weight=$(classify_interface "$iface")
+            if [[ "$iface_weight" -lt "$current_primary_weight" ]]; then
+                local is_healthy="${health_map[$iface]}"
+                local successes
+                successes=$(get_consecutive_successes "$iface")
+                if [[ "$is_healthy" -eq 0 && "$successes" -ge "$THRESHOLD_RECOVERY" ]]; then
+                    target_primary="$iface"
+                    log_info "Higher priority link ${iface} recovered (${successes}/${THRESHOLD_RECOVERY} successes); preempting ${current_primary}"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # 2. If no higher-priority link preempted, evaluate current primary against failure threshold
+    if [[ -z "$target_primary" && -n "$current_primary" ]]; then
+        local primary_fails
+        primary_fails=$(get_consecutive_failures "$current_primary")
+        if [[ "$primary_fails" -lt "$THRESHOLD_FAIL" ]]; then
+            target_primary="$current_primary"
+            log_debug "Retaining current primary ${current_primary} (failures: ${primary_fails}/${THRESHOLD_FAIL})"
+        else
+            log_warn "Primary interface ${current_primary} demoted (failures: ${primary_fails}/${THRESHOLD_FAIL})"
+        fi
+    fi
+
+    # 3. If primary was demoted or none active, promote best candidate with recovery threshold
+    if [[ -z "$target_primary" ]]; then
+        for iface in "${candidate_ifaces[@]}"; do
+            local is_healthy="${health_map[$iface]}"
+            local successes
+            successes=$(get_consecutive_successes "$iface")
+
+            if [[ "$is_healthy" -eq 0 && "$successes" -ge "$THRESHOLD_RECOVERY" ]]; then
+                target_primary="$iface"
+                log_info "Promoting candidate ${iface} to primary (consecutive successes: ${successes}/${THRESHOLD_RECOVERY})"
+                break
+            fi
+        done
+    fi
+
+    # 3. Fallback Tier 1: Select first operational interface if recovery threshold not yet reached
+    if [[ -z "$target_primary" ]]; then
+        for iface in "${candidate_ifaces[@]}"; do
+            if [[ "${health_map[$iface]}" -eq 0 ]]; then
+                target_primary="$iface"
+                log_info "Fallback: Selected healthy interface ${iface} (recovery gating bypassed during outage)"
+                break
+            fi
+        done
+    fi
+
+    # 4. Fallback Tier 2: Maintain highest-priority interface during total outage at degraded metric
+    if [[ -z "$target_primary" && ${#candidate_ifaces[@]} -gt 0 ]]; then
+        target_primary="${candidate_ifaces[0]}"
+        log_warn "All interfaces degraded. Retaining highest-priority interface ${target_primary} as degraded fallback"
+    fi
+
+    # Route Reconciliation Pass
+    for idx in "${!candidate_ifaces[@]}"; do
+        local iface="${candidate_ifaces[$idx]}"
+        local gw="${gateways[$idx]}"
+
+        [[ -z "$gw" ]] && continue
+
+        if [[ "$iface" == "$target_primary" ]]; then
+            reconcile_interface_route "$iface" "$gw" "$METRIC_PRIMARY"
+        else
+            if [[ "${health_map[$iface]}" -eq 0 ]]; then
+                reconcile_interface_route "$iface" "$gw" "$METRIC_BACKUP"
+            else
+                reconcile_interface_route "$iface" "$gw" "$METRIC_DEGRADED"
+            fi
+        fi
+    done
+
+    # Synchronize systemd-resolved DNS routing domains
+    if [[ -n "$target_primary" ]]; then
+        sync_dns_resolver "$target_primary" "${candidate_ifaces[@]}"
+    fi
+}
+
+# ---------------------------------------------------------
+# MAIN EXECUTION ENTRYPOINT
+# ---------------------------------------------------------
+main() {
+    setup_environment
+
+    if [[ "$FLAG_STATUS" == true ]]; then
+        show_status
+        exit 0
+    fi
+
+    log_info "net-failover-watchdog v${VERSION} initialized (PID: $$)"
+
+    if [[ "$FLAG_ONCE" == true ]]; then
+        log_info "Executing single failover reconciliation cycle..."
+        run_watchdog_cycle
+        log_info "Single cycle completed."
+        exit 0
+    fi
+
+    while true; do
+        # Check for pending SIGHUP config reload
+        if [[ "$FLAG_RELOAD" == true ]]; then
+            perform_reload
+        fi
+        run_watchdog_cycle
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+main "$@"

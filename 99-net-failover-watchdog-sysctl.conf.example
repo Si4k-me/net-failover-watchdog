@@ -1,0 +1,51 @@
+# /etc/sysctl.d/99-net-failover-watchdog.conf.example
+#
+# Optional Host-Wide Sysctl Tuning for Multi-WAN / Failover Linux Hosts
+#
+# NOTICE:
+# This file is an OPTIONAL, EXPLICIT OPT-IN configuration.
+# It is NOT enabled by default because altering kernel rp_filter and ARP
+# parameters modifies host-wide network stack behavior.
+#
+# To activate these settings:
+#   sudo cp /usr/share/doc/net-failover-watchdog/99-net-failover-watchdog-sysctl.conf.example /etc/sysctl.d/99-net-failover-watchdog.conf
+#   sudo sysctl --system
+#
+
+# -----------------------------------------------------------------------------
+# 1. REVERSE PATH FILTERING (Loose Mode)
+# -----------------------------------------------------------------------------
+# In strict mode (rp_filter = 1), the Linux kernel drops incoming packets if
+# their source address is not reachable via the interface on which they arrived.
+# When the watchdog probes a standby interface (e.g. ping -I eth1 1.1.1.1),
+# the return packet arrives on eth1, but the system's default route points to eth0.
+# Under strict mode, the kernel treats this reply as spoofed and silently drops it.
+#
+# Loose mode (rp_filter = 2, RFC 3704) allows inbound probe replies on secondary
+# links as long as the source IP is reachable via ANY interface on the host,
+# enabling health checks on inactive backup links without disabling spoofing checks.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+
+# -----------------------------------------------------------------------------
+# 2. ARP FLUX PREVENTION (Multi-Homed Hosts)
+# -----------------------------------------------------------------------------
+# When multiple network interfaces are connected to the same subnet or adjacent
+# broadcast domains, the Linux kernel by default responds to ARP requests on any
+# interface, even if the requested IP address belongs to another local interface.
+# This causes "ARP flux", where local traffic flaps between interfaces.
+#
+# arp_ignore = 1: Reply only if the target IP address is configured on the receiving interface.
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.default.arp_ignore = 1
+
+# arp_announce = 2: Always use the best local IP address matching the target subnet
+# when announcing local addresses in ARP requests.
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.default.arp_announce = 2
+
+# -----------------------------------------------------------------------------
+# 3. ROUTING CACHE RECOVERY
+# -----------------------------------------------------------------------------
+# Accelerate route garbage collection recovery during rapid topological transitions.
+net.ipv4.route.gc_timeout = 60
