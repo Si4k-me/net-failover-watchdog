@@ -103,7 +103,7 @@ setup_veth_pair() {
 # -----------------------------------------------------------------------------
 info "Test 1: CLI options (--help, --version, --status)"
 if "$DAEMON" --help | grep -q "Usage: net-failover-watchdog" && \
-   "$DAEMON" --version | grep -q "net-failover-watchdog v1.0.0"; then
+   "$DAEMON" --version | grep -q "net-failover-watchdog v1.1.0"; then
     pass "CLI flags --help and --version report correct usage and version"
 else
     fail "CLI flags --help or --version failed" "Unexpected output format"
@@ -434,6 +434,52 @@ if grep -q 'INTERFACE_WEIGHTS\["veth1"\]=1' "${TEST_DROP_IN}/priority.conf" 2>/d
     pass "Space-separated priority CLI syntax verified without requiring shell redirection operators"
 else
     fail "Space-separated priority CLI syntax failed" "$(cat "${TEST_DROP_IN}/priority.conf" 2>/dev/null || echo 'missing')"
+fi
+
+# -----------------------------------------------------------------------------
+# TEST 15: IPv6 Dual-Stack Default Route Synchronization
+# -----------------------------------------------------------------------------
+info "Test 15: IPv6 Dual-Stack Default Route Metric Synchronization"
+ip -6 addr add 2001:db8:10::2/64 dev veth0 2>/dev/null || true
+ip -6 addr add 2001:db8:20::2/64 dev veth1 2>/dev/null || true
+ip -6 route add default via 2001:db8:10::1 dev veth0 metric 1024 2>/dev/null || true
+ip -6 route add default via 2001:db8:20::1 dev veth1 metric 1024 2>/dev/null || true
+
+V6_CONF="${TEST_TMP}/v6_test.conf"
+cp "${TEST_TMP}/test.conf" "$V6_CONF"
+echo "ENABLE_IPV6=true" >> "$V6_CONF"
+
+rm -f "${TEST_DROP_IN}/priority.conf"
+"$DAEMON" -c "$V6_CONF" --once >/dev/null 2>&1
+
+v6_metric_v0=$(ip -6 route show default dev veth0 | awk '{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+v6_metric_v1=$(ip -6 route show default dev veth1 | awk '{for(i=1;i<=NF;i++) if($i=="metric") print $(i+1)}')
+
+if [[ "$v6_metric_v0" == "50" && "$v6_metric_v1" == "200" ]]; then
+    pass "IPv6 default route metrics synchronized: veth0 promoted to 50, veth1 to 200"
+else
+    fail "IPv6 default route synchronization failed" "veth0: $v6_metric_v0 (expected 50), veth1: $v6_metric_v1 (expected 200)"
+fi
+
+# -----------------------------------------------------------------------------
+# TEST 16: Pure Declarative Parser Immunity (No Command Execution)
+# -----------------------------------------------------------------------------
+info "Test 16: Pure Declarative Config Parser Shell Injection Immunity"
+INJECTION_CONF="${TEST_TMP}/injection.conf"
+cat <<EOF > "$INJECTION_CONF"
+CHECK_INTERVAL=2
+MALICIOUS_CMD=\$(touch "${TEST_TMP}/exploit_marker")
+WEIGHT_LAN=1; touch "${TEST_TMP}/exploit_marker2"
+EOF
+
+# Parse via common library directly
+source "$COMMON_LIB"
+parse_declarative_config "$INJECTION_CONF"
+
+if [[ ! -f "${TEST_TMP}/exploit_marker" && ! -f "${TEST_TMP}/exploit_marker2" && "$CHECK_INTERVAL" == "2" ]]; then
+    pass "Declarative config parser parsed valid keys and neutralized shell injection without execution"
+else
+    fail "Declarative config parser permitted execution of injected command" "Marker file was created"
 fi
 
 echo "============================================================"

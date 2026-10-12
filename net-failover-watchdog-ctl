@@ -11,7 +11,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly CTL_VERSION="1.0.0"
+readonly CTL_VERSION="1.1.0"
 readonly MAIN_CONFIG="${CONFIG_FILE:-/etc/net-failover-watchdog.conf}"
 readonly DROP_IN_DIR="${DROP_IN_DIR:-/etc/net-failover-watchdog.d}"
 readonly PRIORITY_CONF="${DROP_IN_DIR}/priority.conf"
@@ -133,34 +133,24 @@ ensure_drop_in_dir() {
 load_effective_priorities() {
     local -A type_weights=([LAN]=1 [USB]=2 [WIFI]=3 [OTHER]=4)
     local -A iface_weights=()
+    declare -g -A INTERFACE_WEIGHTS=()
 
     if [[ -f "$MAIN_CONFIG" ]]; then
-        local w
-        w=$(grep -E '^\s*WEIGHT_LAN='  "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[LAN]="$WEIGHT_LAN" || true
-        w=$(grep -E '^\s*WEIGHT_USB='  "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[USB]="$WEIGHT_USB" || true
-        w=$(grep -E '^\s*WEIGHT_WIFI=' "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[WIFI]="$WEIGHT_WIFI" || true
-        w=$(grep -E '^\s*WEIGHT_OTHER=' "$MAIN_CONFIG" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[OTHER]="$WEIGHT_OTHER" || true
-
-        while IFS= read -r line; do
-            if [[ "$line" =~ INTERFACE_WEIGHTS\[\"?([a-zA-Z0-9_-]+)\"?\]=([0-9]+) ]]; then
-                iface_weights["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-            fi
-        done < <(grep -E '^\s*INTERFACE_WEIGHTS\[' "$MAIN_CONFIG" 2>/dev/null || true)
+        parse_declarative_config "$MAIN_CONFIG"
     fi
 
     if [[ -f "$PRIORITY_CONF" ]]; then
-        local w
-        w=$(grep -E '^\s*WEIGHT_LAN='  "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[LAN]="$WEIGHT_LAN" || true
-        w=$(grep -E '^\s*WEIGHT_USB='  "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[USB]="$WEIGHT_USB" || true
-        w=$(grep -E '^\s*WEIGHT_WIFI=' "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[WIFI]="$WEIGHT_WIFI" || true
-        w=$(grep -E '^\s*WEIGHT_OTHER=' "$PRIORITY_CONF" 2>/dev/null | tail -1) && eval "$w" 2>/dev/null && type_weights[OTHER]="$WEIGHT_OTHER" || true
-
-        while IFS= read -r line; do
-            if [[ "$line" =~ INTERFACE_WEIGHTS\[\"?([a-zA-Z0-9_-]+)\"?\]=([0-9]+) ]]; then
-                iface_weights["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-            fi
-        done < <(grep -E '^\s*INTERFACE_WEIGHTS\[' "$PRIORITY_CONF" 2>/dev/null || true)
+        parse_declarative_config "$PRIORITY_CONF"
     fi
+
+    type_weights[LAN]="${WEIGHT_LAN:-1}"
+    type_weights[USB]="${WEIGHT_USB:-2}"
+    type_weights[WIFI]="${WEIGHT_WIFI:-3}"
+    type_weights[OTHER]="${WEIGHT_OTHER:-4}"
+
+    for iface in "${!INTERFACE_WEIGHTS[@]}"; do
+        iface_weights["$iface"]="${INTERFACE_WEIGHTS[$iface]}"
+    done
 
     echo "TYPE_WEIGHTS:"
     for t in LAN USB WIFI OTHER; do

@@ -11,7 +11,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 
 # ---------------------------------------------------------
 # DEFAULT CONFIGURATION VALUES
@@ -30,6 +30,14 @@ CHECK_INTERVAL=3
 L3_TARGETS=("1.1.1.1" "8.8.8.8" "9.9.9.9" "208.67.222.222")
 L3_QUORUM=2
 L3_TIMEOUT=1
+
+# IPv6 dual-stack management and target options
+ENABLE_IPV6=false
+L3_TARGETS_V6=("2606:4700:4700::1111" "2001:4860:4860::8888")
+
+# Probe optimizations
+PROBE_LOCAL_GATEWAY=false
+ADAPTIVE_PROBING=true
 
 # Layer 7 validation endpoints (Captive Portal & Egress Verification)
 L7_CHECK_ENABLED=true
@@ -202,9 +210,7 @@ load_configuration() {
             return 1
         fi
         log_debug "Loading configuration from ${CONFIG_FILE}"
-        # Transform any declare without -g into declare -g to ensure global scope
-        # shellcheck source=/dev/null
-        source <(sed -E 's/^[[:space:]]*declare -A/declare -g -A/' "$CONFIG_FILE")
+        parse_declarative_config "$CONFIG_FILE"
     else
         log_debug "Configuration file ${CONFIG_FILE} not found; using internal defaults"
     fi
@@ -219,8 +225,7 @@ load_configuration() {
                 continue
             fi
             log_debug "Loading drop-in configuration: ${drop_in}"
-            # shellcheck source=/dev/null
-            source <(sed -E 's/^[[:space:]]*declare -A/declare -g -A/' "$drop_in")
+            parse_declarative_config "$drop_in"
         done
     fi
 }
@@ -313,6 +318,18 @@ probe_l3_quorum() {
     local success_count=0
     local pids=()
 
+    # Optional local gateway verification (fails fast on local transceiver/AP disconnection)
+    if [[ "$PROBE_LOCAL_GATEWAY" == true ]]; then
+        local gw
+        gw=$(get_interface_gateway "$iface" || echo "")
+        if [[ -n "$gw" && "$gw" != "dev" ]]; then
+            if ! ping -c 1 -W "$L3_TIMEOUT" -I "$iface" "$gw" >/dev/null 2>&1; then
+                log_debug "Interface ${iface} failed local gateway probe (${gw})"
+                return 1
+            fi
+        fi
+    fi
+
     for target in "${L3_TARGETS[@]}"; do
         (
             if ping -c 1 -W "$L3_TIMEOUT" -I "$iface" "$target" >/dev/null 2>&1; then
@@ -324,13 +341,27 @@ probe_l3_quorum() {
         pids+=($!)
     done
 
+    # Probe IPv6 Anycast targets concurrently if IPv6 is enabled and interface has global IPv6
+    if [[ "$ENABLE_IPV6" == true ]] && has_ipv6_global_address "$iface"; then
+        for v6_target in "${L3_TARGETS_V6[@]}"; do
+            (
+                if ping -6 -c 1 -W "$L3_TIMEOUT" -I "$iface" "$v6_target" >/dev/null 2>&1; then
+                    exit 0
+                else
+                    exit 1
+                fi
+            ) &
+            pids+=($!)
+        done
+    fi
+
     for pid in "${pids[@]}"; do
         if wait "$pid"; then
             (( success_count += 1 ))
         fi
     done
 
-    log_debug "Interface ${iface} L3 quorum: ${success_count}/${#L3_TARGETS[@]} responded (required: ${L3_QUORUM})"
+    log_debug "Interface ${iface} L3 quorum: ${success_count} probes responded (required: ${L3_QUORUM})"
     if [[ "$success_count" -ge "$L3_QUORUM" ]]; then
         return 0
     fi
@@ -562,6 +593,46 @@ reconcile_interface_route() {
             fi
         fi
     done
+
+    # Synchronize IPv6 default route metric if enabled and present on the interface
+    if [[ "$ENABLE_IPV6" == true ]]; then
+        local v6_gw
+        v6_gw=$(get_interface_ipv6_gateway "$iface" || echo "")
+        if [[ -n "$v6_gw" ]]; then
+            log_debug "Synchronizing IPv6 default route on dev ${iface} via ${v6_gw} metric ${target_metric}"
+            if [[ "$FLAG_DRY_RUN" == false ]]; then
+                if [[ "$v6_gw" == "dev" ]]; then
+                    ip -6 route add default dev "$iface" metric "$target_metric" 2>/dev/null || \
+                    ip -6 route replace default dev "$iface" metric "$target_metric" 2>/dev/null || true
+                else
+                    ip -6 route add default via "$v6_gw" dev "$iface" metric "$target_metric" 2>/dev/null || \
+                    ip -6 route replace default via "$v6_gw" dev "$iface" metric "$target_metric" 2>/dev/null || true
+                fi
+
+                # Prune stale IPv6 default routes with non-matching metrics
+                local v6_routes
+                v6_routes=$(ip -6 route show default dev "$iface" 2>/dev/null || true)
+                while IFS= read -r rline; do
+                    [[ -z "$rline" ]] && continue
+                    local rm="0"
+                    if [[ "$rline" =~ metric\ ([0-9]+) ]]; then
+                        rm="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$rm" -ne "$target_metric" ]]; then
+                        local rgw=""
+                        if [[ "$rline" =~ via\ ([0-9a-fA-F:]+) ]]; then
+                            rgw="${BASH_REMATCH[1]}"
+                        fi
+                        if [[ -n "$rgw" ]]; then
+                            ip -6 route del default via "$rgw" dev "$iface" metric "$rm" 2>/dev/null || true
+                        else
+                            ip -6 route del default dev "$iface" metric "$rm" 2>/dev/null || true
+                        fi
+                    fi
+                done <<< "$v6_routes"
+            fi
+        fi
+    fi
 }
 
 # ---------------------------------------------------------

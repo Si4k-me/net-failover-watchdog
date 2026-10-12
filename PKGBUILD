@@ -1,7 +1,7 @@
 # Maintainer: Akshit Kamboj <akshitkamboz13@gmail.com>
 
 pkgname=net-failover-watchdog
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Health-aware Linux network failover daemon with configurable interface priorities, hysteresis, IPv4 route management and connectivity verification"
 arch=('any')
@@ -20,16 +20,14 @@ source=(
     "LICENSE"
     "README.md"
 )
-sha256sums=(
-    '73a6979605342ad00aef30548a40bd04c33dc6df7453f8ff02a9e92de8e70640'
-    '0ad783e1b28d5402a96e504fd35e3eb4d44ebfb803eb387f1ee8c88f02feb610'
-    'f6d938b06cf26ed792e192e78f7e2974ba453eb903d6e4219d2d72c0874d6a22'
-    'b8bdc6cae72dbaa418595e6596916137b2ac8c8272572dc511220a4733f9f35c'
-    'cfb6ec27d8f6e987f710aac9240b7db73ddf46b774a9fedd1aa44b4e7ed8aa8b'
-    'c3761502e5eae5ed190db46745a02b910686d63f69cd8edf229bb3e593ef4d7c'
-    'dc32706fbbe2fc7204d78b73db8cd57fa7438c92416e480d0959d54525f33b1c'
-    'f68fdc06ac87cb26fc547f405515bb8033dc2fc8cabe2341686b2fff7ea74686'
-)
+sha256sums=('5efc4995865d9c50d14f70362a8f5185d58f0bbe8e7aa220921044f01c564819'
+            'c9438ff2f4135a43dcc048ec47b2ae082985548f41237fa53effef9e78493d84'
+            'f68ec060281b8bed2122e50955c78fa90258ca52c352ec6b01b70675cb6fb169'
+            'b8bdc6cae72dbaa418595e6596916137b2ac8c8272572dc511220a4733f9f35c'
+            '4c2a51b27affe95159673ef66d3794bd0d2b9e04f1a8f8021d1eabd544ace64f'
+            'c3761502e5eae5ed190db46745a02b910686d63f69cd8edf229bb3e593ef4d7c'
+            'dc32706fbbe2fc7204d78b73db8cd57fa7438c92416e480d0959d54525f33b1c'
+            'c818ab7bf2b41dca1e4057a340d869fbc358f8afc227478a5d85dcb14d124c01')
 
 package() {
     install -Dm755 "${srcdir}/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"

@@ -12,12 +12,13 @@
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
-  <img src="https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen.svg" alt="Tests: 14/14 Passing">
+  <img src="https://img.shields.io/badge/Tests-16%2F16%20Passing-brightgreen.svg" alt="Tests: 16/16 Passing">
+  <img src="https://img.shields.io/badge/Version-1.1.0-blue.svg" alt="Version: 1.1.0">
 </p>
 
 `net-failover-watchdog` is a lightweight, hardened multi-WAN failover engine designed for Linux desktops, laptops, and edge devices that switch between **Ethernet**, **USB tethering / cellular modems**, and **Wi-Fi**.
 
-Unlike naive shell scripts that induce route flapping, poll dead interfaces sequentially, or blackhole traffic behind captive portals, `net-failover-watchdog` provides kernel-level route deduplication, asymmetric hysteresis, multi-tier health verification, and systemd-resolved DNS synchronization.
+Unlike naive shell scripts that induce route flapping, poll dead interfaces sequentially, or blackhole traffic behind captive portals, `net-failover-watchdog` provides kernel-level route deduplication, asymmetric hysteresis, multi-tier health verification, dual-stack IPv6 synchronization, and systemd-resolved DNS coordination.
 
 ---
 
@@ -28,6 +29,16 @@ Unlike naive shell scripts that induce route flapping, poll dead interfaces sequ
   - Reorder interface priorities on the fly via CLI (e.g. `lan > usb > wifi > other` or `usb > lan > wifi > other`).
   - Seamlessly handle multiple instances of physical links (multiple LAN cards, USB dongles, or Wi-Fi cards: `eth0 > usb0 > enp3s0 > wlan0`).
   - Hot-applies changes immediately: pauses the current monitoring cycle, reloads the configuration, and restarts route reconciliation with the new order.
+- **Pure Declarative Config Parsing & Defense-in-Depth Security**:
+  - Completely eliminates `source` and `eval` on configuration files.
+  - Strict tokenizer enforces integer ranges, boolean flags, whitelisted URLs, and array definitions without arbitrary command execution risks.
+  - Hardened with file privilege checks (root ownership and strict write permissions).
+- **IPv6 Dual-Stack Default Route Synchronization**:
+  - Optional dual-stack management (`ENABLE_IPV6=true`).
+  - Synchronizes IPv6 default routes alongside IPv4 metrics (`50` primary, `200` standby), preventing modern dual-stack applications (Happy Eyeballs / RFC 8305) from bypassing IPv4 failover policy.
+- **Adaptive Probing & Local Gateway Fast-Fail**:
+  - **Local Gateway Pre-check**: Optional `PROBE_LOCAL_GATEWAY=true` verifies local router responsiveness before outbound Anycast pings.
+  - **Adaptive Backoff**: Automatically throttles probe intensity on persistently failed links, conserving bandwidth and battery on metered cellular modems.
 - **Asymmetric Hysteresis State Machine**:
   - **Fast Failover**: Rapidly demotes a failing primary interface after configurable consecutive drops ($\Theta_{\text{fail}} = 3$ cycles $\approx$ 9s).
   - **Conservative Recovery**: Requires sustained error-free uptime ($\Theta_{\text{recovery}} = 10$ cycles $\approx$ 30s) before reinstating a recovered primary, eliminating route flapping on marginal links.
@@ -39,7 +50,7 @@ Unlike naive shell scripts that induce route flapping, poll dead interfaces sequ
   - Manages priority metrics (`50` for primary, `200` for standby, `500` for degraded).
   - Actively deduplicates unmanaged, unmetered, or rogue default routes re-injected by DHCP renewals (NetworkManager, systemd-networkd, dhcpcd).
   - Supports point-to-point and direct device default routes.
-- **DNS Resolver Alignment**: Coordinates with `systemd-resolved` via `resolvectl` to re-align per-link routing domains and flush stale DNS negative caches upon failover.
+- **DNS Resolver Alignment**: Coordinates with `systemd-resolved` via `resolvectl` to re-align per-link routing domains and flush stale DNS negative caches only on primary link transitions.
 - **Strict Reverse-Path Filtering Awareness**: Inspects effective `rp_filter` states, providing clear guidance and optional opt-in handling without altering global host defaults.
 - **Production Systemd Sandboxing**: Ships with Linux capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`), strict filesystem protection, and private temporary directories.
 
@@ -321,6 +332,8 @@ The test matrix validates:
 12. CLI priority reset & reversion to defaults.
 13. Configuration file security ingestion guard (rejecting disallowed command substitution).
 14. Non-hostile space-separated and quoted priority CLI syntax.
+15. IPv6 dual-stack default route metric synchronization and stale route pruning.
+16. Pure declarative configuration parser execution safety and shell injection immunity.
 
 ---
 

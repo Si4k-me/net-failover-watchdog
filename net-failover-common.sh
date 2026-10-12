@@ -117,6 +117,12 @@ has_ipv4_address() {
     ip -4 addr show dev "$iface" 2>/dev/null | grep -q "inet "
 }
 
+has_ipv6_global_address() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 1
+    ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q "inet6 "
+}
+
 get_interface_gateway() {
     local iface="$1"
     [[ -z "$iface" ]] && return 1
@@ -131,6 +137,27 @@ get_interface_gateway() {
     fi
 
     # Device-only route (point-to-point or link-scoped without via)
+    if [[ "$route_line" =~ ^default ]]; then
+        echo "dev"
+        return 0
+    fi
+
+    return 1
+}
+
+get_interface_ipv6_gateway() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 1
+
+    local route_line
+    route_line=$(ip -6 route show default dev "$iface" 2>/dev/null | head -n 1 || true)
+    [[ -z "$route_line" ]] && return 1
+
+    if [[ "$route_line" =~ via\ ([0-9a-fA-F:]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
     if [[ "$route_line" =~ ^default ]]; then
         echo "dev"
         return 0
@@ -250,3 +277,140 @@ verify_config_file_safety() {
 
     return 0
 }
+
+# ---------------------------------------------------------
+# DECLARATIVE CONFIGURATION PARSER
+# ---------------------------------------------------------
+# Safely parses key=value, arrays, and associative array overrides
+# without executing 'source' or 'eval' on configuration files.
+parse_declarative_config() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 0
+
+    local pat_override='^INTERFACE_WEIGHTS\[[\"'\'']?([a-zA-Z0-9_.-]+)[\"'\'']?\]=([0-9]+)$'
+    local pat_array_single='^([A-Z0-9_]+)=\((.*)\)$'
+    local pat_array_start='^([A-Z0-9_]+)=\((.*)$'
+    local pat_scalar='^([A-Z0-9_]+)=(.*)$'
+    local pat_unsafe='[;&|\`\$]'
+
+    local in_array=""
+    local array_buffer=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+        # Associative array compound assignment: INTERFACE_WEIGHTS=( ["veth0"]=1 ["veth1"]=2 )
+        if [[ "$line" =~ INTERFACE_WEIGHTS=\((.*)\) ]]; then
+            local map_content="${BASH_REMATCH[1]}"
+            while [[ "$map_content" =~ \[[\"\']?([a-zA-Z0-9_.-]+)[\"\']?\]=([0-9]+) ]]; do
+                local mk="${BASH_REMATCH[1]}"
+                local mv="${BASH_REMATCH[2]}"
+                INTERFACE_WEIGHTS["$mk"]="$mv"
+                map_content="${map_content#*${BASH_REMATCH[0]}}"
+            done
+            continue
+        fi
+
+        # Ignore standalone declare statements (e.g. declare -A INTERFACE_WEIGHTS)
+        [[ "$line" =~ ^declare[[:space:]]+-[a-zA-Z]+ ]] && continue
+
+        if [[ -n "$in_array" ]]; then
+            if [[ "$line" =~ (.*)\)[[:space:]]*(#.*)?$ ]]; then
+                array_buffer+=" ${BASH_REMATCH[1]}"
+                local items=()
+                local raw_items
+                read -r -a raw_items <<< "$array_buffer"
+                for token in "${raw_items[@]}"; do
+                    token="${token%\"}"
+                    token="${token#\"}"
+                    token="${token%\'}"
+                    token="${token#\'}"
+                    [[ -n "$token" ]] && items+=("$token")
+                done
+                case "$in_array" in
+                    L3_TARGETS) L3_TARGETS=("${items[@]}") ;;
+                    L3_TARGETS_V6) L3_TARGETS_V6=("${items[@]}") ;;
+                    IGNORED_INTERFACES) IGNORED_INTERFACES=("${items[@]}") ;;
+                    MANAGED_INTERFACES) MANAGED_INTERFACES=("${items[@]}") ;;
+                esac
+                in_array=""
+                array_buffer=""
+            else
+                array_buffer+=" $line"
+            fi
+            continue
+        fi
+
+        if [[ "$line" =~ $pat_override ]]; then
+            INTERFACE_WEIGHTS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+            continue
+        fi
+
+        if [[ "$line" =~ $pat_array_single ]]; then
+            local arr_var="${BASH_REMATCH[1]}"
+            local arr_raw="${BASH_REMATCH[2]}"
+            local items=()
+            local raw_items
+            read -r -a raw_items <<< "$arr_raw"
+            for token in "${raw_items[@]}"; do
+                token="${token%\"}"
+                token="${token#\"}"
+                token="${token%\'}"
+                token="${token#\'}"
+                [[ -n "$token" ]] && items+=("$token")
+            done
+            case "$arr_var" in
+                L3_TARGETS) L3_TARGETS=("${items[@]}") ;;
+                L3_TARGETS_V6) L3_TARGETS_V6=("${items[@]}") ;;
+                IGNORED_INTERFACES) IGNORED_INTERFACES=("${items[@]}") ;;
+                MANAGED_INTERFACES) MANAGED_INTERFACES=("${items[@]}") ;;
+            esac
+            continue
+        fi
+
+        if [[ "$line" =~ $pat_array_start ]]; then
+            in_array="${BASH_REMATCH[1]}"
+            array_buffer="${BASH_REMATCH[2]}"
+            continue
+        fi
+
+        if [[ "$line" =~ $pat_scalar ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+
+            # Strip inline comments (unless quoted)
+            if [[ "$val" =~ ^\"[^\"]*\" ]] || [[ "$val" =~ ^\'[^\']*\' ]]; then
+                val=$(echo "$val" | sed -E "s/^([\"'].*[\"'])[[:space:]]*#.*$/\1/")
+            else
+                val="${val%%#*}"
+            fi
+            val="${val%"${val##*[![:space:]]}"}"
+
+            val="${val%\"}"
+            val="${val#\"}"
+            val="${val%\'}"
+            val="${val#\'}"
+
+            case "$key" in
+                CHECK_INTERVAL|L3_QUORUM|L3_TIMEOUT|L7_TIMEOUT|METRIC_PRIMARY|METRIC_BACKUP|METRIC_DEGRADED|THRESHOLD_FAIL|THRESHOLD_RECOVERY|WEIGHT_LAN|WEIGHT_USB|WEIGHT_WIFI|WEIGHT_WWAN|WEIGHT_OTHER)
+                    if [[ "$val" =~ ^[0-9]+$ ]]; then
+                        printf -v "$key" "%s" "$val"
+                    fi
+                    ;;
+                L7_CHECK_ENABLED|DNS_SYNC_ENABLED|AUTO_CONFIG_RP_FILTER|ENABLE_IPV6|PROBE_LOCAL_GATEWAY|ADAPTIVE_PROBING)
+                    if [[ "$val" == "true" || "$val" == "false" || "$val" == "auto" ]]; then
+                        printf -v "$key" "%s" "$val"
+                    fi
+                    ;;
+                L7_URL_*|L7_MSFT_EXPECTED|STATE_DIR|LOCK_FILE|LOG_LEVEL|MANAGED_INTERFACES)
+                    if [[ ! "$val" =~ $pat_unsafe ]]; then
+                        printf -v "$key" "%s" "$val"
+                    fi
+                    ;;
+            esac
+        fi
+    done < "$file"
+}
+
