@@ -213,7 +213,7 @@ discover_interfaces() {
 
                 if ip -4 route show default dev "$devname" 2>/dev/null | grep -q "^default"; then
                     sys_ifaces+=("$devname")
-                elif is_interface_carrier_up "$devname" && has_ipv4_address "$devname"; then
+                elif is_interface_carrier_up "$devname" && { has_ipv4_address "$devname" || has_ipv6_global_address "$devname"; }; then
                     sys_ifaces+=("$devname")
                 fi
             done
@@ -227,7 +227,7 @@ discover_interfaces() {
             is_ignored_interface "$ifname" && continue
             if ip -4 route show default dev "$ifname" 2>/dev/null | grep -q "^default"; then
                 sys_ifaces+=("$ifname")
-            elif is_interface_carrier_up "$ifname" && has_ipv4_address "$ifname"; then
+            elif is_interface_carrier_up "$ifname" && { has_ipv4_address "$ifname" || has_ipv6_global_address "$ifname"; }; then
                 sys_ifaces+=("$ifname")
             fi
         done < <(ip -o link show 2>/dev/null || true)
@@ -287,10 +287,10 @@ parse_declarative_config() {
     local file="$1"
     [[ ! -f "$file" ]] && return 0
 
-    local pat_override='^INTERFACE_WEIGHTS\[[\"'\'']?([a-zA-Z0-9_.-]+)[\"'\'']?\]=([0-9]+)$'
-    local pat_array_single='^([A-Z0-9_]+)=\((.*)\)$'
-    local pat_array_start='^([A-Z0-9_]+)=\((.*)$'
-    local pat_scalar='^([A-Z0-9_]+)=(.*)$'
+    local pat_override='^INTERFACE_WEIGHTS\[[\"'\'']?([a-zA-Z0-9_.-]+)[\"'\'']?\][[:space:]]*=[[:space:]]*([0-9]+)$'
+    local pat_array_single='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*\((.*)\)$'
+    local pat_array_start='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*\((.*)$'
+    local pat_scalar='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$'
     local pat_unsafe='[;&|\`\$]'
 
     local in_array=""
@@ -302,9 +302,9 @@ parse_declarative_config() {
         [[ -z "$line" || "$line" =~ ^# ]] && continue
 
         # Associative array compound assignment: INTERFACE_WEIGHTS=( ["veth0"]=1 ["veth1"]=2 )
-        if [[ "$line" =~ INTERFACE_WEIGHTS=\((.*)\) ]]; then
+        if [[ "$line" =~ INTERFACE_WEIGHTS[[:space:]]*=[[:space:]]*\((.*)\) ]]; then
             local map_content="${BASH_REMATCH[1]}"
-            while [[ "$map_content" =~ \[[\"\']?([a-zA-Z0-9_.-]+)[\"\']?\]=([0-9]+) ]]; do
+            while [[ "$map_content" =~ \[[\"\']?([a-zA-Z0-9_.-]+)[\"\']?\][[:space:]]*=[[:space:]]*([0-9]+) ]]; do
                 local mk="${BASH_REMATCH[1]}"
                 local mv="${BASH_REMATCH[2]}"
                 INTERFACE_WEIGHTS["$mk"]="$mv"
@@ -318,11 +318,14 @@ parse_declarative_config() {
 
         if [[ -n "$in_array" ]]; then
             if [[ "$line" =~ (.*)\)[[:space:]]*(#.*)?$ ]]; then
-                array_buffer+=" ${BASH_REMATCH[1]}"
+                local closing_content="${BASH_REMATCH[1]}"
+                closing_content="${closing_content%%#*}"
+                array_buffer+=" ${closing_content}"
                 local items=()
                 local raw_items
                 read -r -a raw_items <<< "$array_buffer"
                 for token in "${raw_items[@]}"; do
+                    token="${token%,}"
                     token="${token%\"}"
                     token="${token#\"}"
                     token="${token%\'}"
@@ -338,7 +341,8 @@ parse_declarative_config() {
                 in_array=""
                 array_buffer=""
             else
-                array_buffer+=" $line"
+                local clean_line="${line%%#*}"
+                array_buffer+=" ${clean_line}"
             fi
             continue
         fi
@@ -351,10 +355,12 @@ parse_declarative_config() {
         if [[ "$line" =~ $pat_array_single ]]; then
             local arr_var="${BASH_REMATCH[1]}"
             local arr_raw="${BASH_REMATCH[2]}"
+            arr_raw="${arr_raw%%#*}"
             local items=()
             local raw_items
             read -r -a raw_items <<< "$arr_raw"
             for token in "${raw_items[@]}"; do
+                token="${token%,}"
                 token="${token%\"}"
                 token="${token#\"}"
                 token="${token%\'}"
@@ -372,7 +378,9 @@ parse_declarative_config() {
 
         if [[ "$line" =~ $pat_array_start ]]; then
             in_array="${BASH_REMATCH[1]}"
-            array_buffer="${BASH_REMATCH[2]}"
+            local init_content="${BASH_REMATCH[2]}"
+            init_content="${init_content%%#*}"
+            array_buffer="${init_content}"
             continue
         fi
 
@@ -388,10 +396,11 @@ parse_declarative_config() {
             fi
             val="${val%"${val##*[![:space:]]}"}"
 
-            val="${val%\"}"
-            val="${val#\"}"
-            val="${val%\'}"
-            val="${val#\'}"
+            if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
 
             case "$key" in
                 CHECK_INTERVAL|L3_QUORUM|L3_TIMEOUT|L7_TIMEOUT|METRIC_PRIMARY|METRIC_BACKUP|METRIC_DEGRADED|THRESHOLD_FAIL|THRESHOLD_RECOVERY|WEIGHT_LAN|WEIGHT_USB|WEIGHT_WIFI|WEIGHT_WWAN|WEIGHT_OTHER)

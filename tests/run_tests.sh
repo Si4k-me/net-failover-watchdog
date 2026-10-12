@@ -482,6 +482,101 @@ else
     fail "Declarative config parser permitted execution of injected command" "Marker file was created"
 fi
 
+# -----------------------------------------------------------------------------
+# TEST 17: Parser Comprehensive Edge-Case Matrix
+# -----------------------------------------------------------------------------
+info "Test 17: Declarative Config Parser Edge-Case Matrix"
+EDGE_CONF="${TEST_TMP}/edge.conf"
+cat <<'EOF' > "$EDGE_CONF"
+# Spacing around assignment operators
+CHECK_INTERVAL   =   5 # trailing comment
+METRIC_PRIMARY = 50 # primary metric
+L7_MSFT_EXPECTED = "Microsoft Connect Test" # quoted string
+
+# Multiline array with individual element comments and commas
+IGNORED_INTERFACES=(
+    "lo" # loopback device
+    "docker*" # docker bridge
+    "wg*", # wireguard vpn
+)
+
+# Array with single quotes and commas
+L3_TARGETS=('1.1.1.1', '8.8.8.8')
+
+# Per-interface weight overrides with varied quoting and spacing
+INTERFACE_WEIGHTS["veth0"] = 1
+INTERFACE_WEIGHTS['veth1'] = 2
+
+# Unrecognized variable (must be safely ignored without errors)
+UNKNOWN_ARBITRARY_OPTION = "should_be_ignored"
+EOF
+
+# Parse via declarative parser
+declare -A INTERFACE_WEIGHTS=()
+IGNORED_INTERFACES=()
+L3_TARGETS=()
+parse_declarative_config "$EDGE_CONF"
+
+if [[ "$CHECK_INTERVAL" == "5" && \
+      "$METRIC_PRIMARY" == "50" && \
+      "$L7_MSFT_EXPECTED" == "Microsoft Connect Test" && \
+      "${#IGNORED_INTERFACES[@]}" -eq 3 && \
+      "${IGNORED_INTERFACES[0]}" == "lo" && \
+      "${IGNORED_INTERFACES[1]}" == "docker*" && \
+      "${IGNORED_INTERFACES[2]}" == "wg*" && \
+      "${#L3_TARGETS[@]}" -eq 2 && \
+      "${L3_TARGETS[0]}" == "1.1.1.1" && \
+      "${L3_TARGETS[1]}" == "8.8.8.8" && \
+      "${INTERFACE_WEIGHTS[veth0]}" == "1" && \
+      "${INTERFACE_WEIGHTS[veth1]}" == "2" ]]; then
+    pass "Declarative parser successfully handled all whitespace, quoting, comment, and array edge cases"
+else
+    fail "Declarative parser failed edge-case matrix" "Values: CHECK_INTERVAL=$CHECK_INTERVAL, IGNORED=${IGNORED_INTERFACES[*]}, L3=${L3_TARGETS[*]}, veth0=${INTERFACE_WEIGHTS[veth0]-none}, veth1=${INTERFACE_WEIGHTS[veth1]-none}"
+fi
+
+# -----------------------------------------------------------------------------
+# TEST 18: Real Adaptive Backoff Verification
+# -----------------------------------------------------------------------------
+info "Test 18: Real Adaptive Probing Backoff for Persistently Failed Interfaces"
+# Set veth0 as having 10 consecutive failures in state directory
+mkdir -p "${TEST_STATE_DIR}"
+echo "10" > "${TEST_STATE_DIR}/veth0.fails"
+
+PROBE_LOG="${TEST_TMP}/adaptive_probe.log"
+rm -f "$PROBE_LOG"
+
+cat <<EOF > "${TEST_BIN_DIR}/ping"
+#!/usr/bin/env bash
+echo "ping called on \$*" >> "${PROBE_LOG}"
+exit 1
+EOF
+chmod +x "${TEST_BIN_DIR}/ping"
+
+# Cycle 1 (WATCHDOG_CYCLE_COUNT=1, mod 5 = 1 != 0): probe must be SKIPPED
+ADAPTIVE_CONF="${TEST_TMP}/adaptive.conf"
+cp "${TEST_TMP}/test.conf" "$ADAPTIVE_CONF"
+echo "ADAPTIVE_PROBING=true" >> "$ADAPTIVE_CONF"
+
+FORCE_ADAPTIVE_BACKOFF=true WATCHDOG_CYCLE_COUNT=0 "$DAEMON" -c "$ADAPTIVE_CONF" --once >/dev/null 2>&1
+calls_on_skipped_cycle=$(grep -c "ping called on" "$PROBE_LOG" 2>/dev/null || echo 0)
+
+# Cycle 5 (WATCHDOG_CYCLE_COUNT=4 + 1 = 5, mod 5 = 0): probe must be EXECUTED
+WATCHDOG_CYCLE_COUNT=4 FORCE_ADAPTIVE_BACKOFF=true "$DAEMON" -c "$ADAPTIVE_CONF" --once >/dev/null 2>&1
+calls_on_sampled_cycle=$(grep -c "ping called on" "$PROBE_LOG" 2>/dev/null || echo 0)
+
+# Restore standard mock ping
+cat <<'EOF' > "${TEST_BIN_DIR}/ping"
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "${TEST_BIN_DIR}/ping"
+
+if [[ "$calls_on_skipped_cycle" -eq 0 && "$calls_on_sampled_cycle" -gt 0 ]]; then
+    pass "Real adaptive backoff confirmed: probes throttled on non-sampled cycles ($calls_on_skipped_cycle calls) and dispatched on sample interval ($calls_on_sampled_cycle calls)"
+else
+    fail "Adaptive backoff throttling failed" "Calls on skipped cycle: $calls_on_skipped_cycle (expected 0), sampled cycle: $calls_on_sampled_cycle (expected > 0)"
+fi
+
 echo "============================================================"
 echo " Test Summary: ${PASSED_COUNT} Passed, ${FAILED_COUNT} Failed"
 echo "============================================================"

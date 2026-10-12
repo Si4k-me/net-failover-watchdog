@@ -23,6 +23,7 @@ DROP_IN_DIR="${DROP_IN_DIR:-/etc/net-failover-watchdog.d}"
 FLAG_RELOAD=false
 FLAG_FORCE_REORDER=false
 LAST_SYNCED_PRIMARY=""
+WATCHDOG_CYCLE_COUNT=0
 
 CHECK_INTERVAL=3
 
@@ -429,6 +430,27 @@ evaluate_interface_health() {
 
     check_and_handle_rp_filter "$iface"
 
+    # Real Adaptive Backoff for Persistently Failed Interfaces:
+    # Throttle probe frequency on degraded links to reduce ICMP/HTTP traffic,
+    # avoid rate limits, and preserve battery/bandwidth on metered links.
+    local fails
+    fails=$(get_consecutive_failures "$iface")
+    if [[ "$ADAPTIVE_PROBING" == true && "$fails" -ge 6 ]]; then
+        local backoff_interval=3
+        if [[ "$fails" -ge 20 ]]; then
+            backoff_interval=10
+        elif [[ "$fails" -ge 10 ]]; then
+            backoff_interval=5
+        fi
+
+        local mod=$(( WATCHDOG_CYCLE_COUNT % backoff_interval ))
+        if [[ "$mod" -ne 0 && ( "$FLAG_ONCE" == false || "${FORCE_ADAPTIVE_BACKOFF:-false}" == true ) ]]; then
+            log_debug "Interface ${iface} in adaptive backoff (${fails} failures); skipping probe cycle (${mod}/${backoff_interval})"
+            return 1
+        fi
+        log_debug "Interface ${iface} in adaptive backoff (${fails} failures); executing sampled health probe"
+    fi
+
     if ! probe_l3_quorum "$iface"; then
         log_debug "Interface ${iface} failed Layer 3 quorum"
         return 1
@@ -685,6 +707,7 @@ show_status() {
 # CORE DECISION AND CONTROL CYCLE
 # ---------------------------------------------------------
 run_watchdog_cycle() {
+    WATCHDOG_CYCLE_COUNT=$(( WATCHDOG_CYCLE_COUNT + 1 ))
     local raw_interfaces=()
     mapfile -t raw_interfaces < <(discover_interfaces)
 

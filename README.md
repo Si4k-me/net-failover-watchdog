@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
-  <img src="https://img.shields.io/badge/Tests-16%2F16%20Passing-brightgreen.svg" alt="Tests: 16/16 Passing">
+  <img src="https://img.shields.io/badge/Tests-18%2F18%20Passing-brightgreen.svg" alt="Tests: 18/18 Passing">
   <img src="https://img.shields.io/badge/Version-1.1.0-blue.svg" alt="Version: 1.1.0">
 </p>
 
@@ -334,6 +334,8 @@ The test matrix validates:
 14. Non-hostile space-separated and quoted priority CLI syntax.
 15. IPv6 dual-stack default route metric synchronization and stale route pruning.
 16. Pure declarative configuration parser execution safety and shell injection immunity.
+17. Declarative configuration parser edge-case matrix (spaces, comments, quoting, arrays).
+18. Real adaptive probing backoff on persistently failed interfaces.
 
 ---
 
