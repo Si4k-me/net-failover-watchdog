@@ -27,7 +27,7 @@ sha256sums=('ac90208cb94dbbfb6029056fde31fde3b7e478510bbfb3534456c94024166732'
             '4c2a51b27affe95159673ef66d3794bd0d2b9e04f1a8f8021d1eabd544ace64f'
             'c3761502e5eae5ed190db46745a02b910686d63f69cd8edf229bb3e593ef4d7c'
             'dc32706fbbe2fc7204d78b73db8cd57fa7438c92416e480d0959d54525f33b1c'
-            'cc506267dc4833321b5d525a16f194ca5a97b7597d937349a46ac96787777c68')
+            'cec681f0319063f47fa8a6d38d13eb1cc4ffaed35fec02db863a55bd1e67e21c')
 
 package() {
     install -Dm755 "${srcdir}/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"

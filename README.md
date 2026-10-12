@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
+  <a href="https://github.com/akshitkamboz13/net-failover-watchdog/actions/workflows/ci.yml"><img src="https://github.com/akshitkamboz13/net-failover-watchdog/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/Tests-18%2F18%20Passing-brightgreen.svg" alt="Tests: 18/18 Passing">
   <img src="https://img.shields.io/badge/Version-1.1.0-blue.svg" alt="Version: 1.1.0">
   <a href="ROADMAP.md"><img src="https://img.shields.io/badge/v2.0-Roadmap%20RFC-orange.svg" alt="v2.0 Roadmap RFC"></a>

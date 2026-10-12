@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Hermetic Test Suite (18 Tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Runtime & Test Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iputils-ping curl gawk util-linux
+          # Ensure unprivileged user namespaces are allowed on Ubuntu 24.04+
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+
+      - name: Run Hermetic Namespace Test Suite
+        run: make check
+
+      - name: Verify Makefile Install and Uninstall
+        run: |
+          mkdir -p /tmp/test-install
+          sudo make install DESTDIR=/tmp/test-install
+          test -x /tmp/test-install/usr/bin/net-failover-watchdog
+          test -x /tmp/test-install/usr/bin/net-failover-watchdog-ctl
+          test -f /tmp/test-install/usr/lib/net-failover-watchdog/net-failover-common.sh
+          test -f /tmp/test-install/etc/net-failover-watchdog.conf
+          sudo make uninstall DESTDIR=/tmp/test-install
+          test ! -f /tmp/test-install/usr/bin/net-failover-watchdog
+
+  package:
+    name: Arch Linux Package Validation
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel git iproute2 iputils curl gawk util-linux
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder .
+
+      - name: Validate .SRCINFO Consistency
+        run: |
+          su builder -c "makepkg --printsrcinfo | diff -u .SRCINFO -"
+
+      - name: Build Package (makepkg)
+        run: |
+          su builder -c "makepkg -f --nodeps"
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-failover-watchdog-pkg
+          path: "*.pkg.tar.zst"
+          if-no-files-found: error
