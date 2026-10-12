@@ -288,6 +288,7 @@ parse_declarative_config() {
     [[ ! -f "$file" ]] && return 0
 
     local pat_override='^INTERFACE_WEIGHTS\[[\"'\'']?([a-zA-Z0-9_.-]+)[\"'\'']?\][[:space:]]*=[[:space:]]*([0-9]+)$'
+    local pat_map_item='\[[\"'\'']?([a-zA-Z0-9_.-]+)[\"'\'']?\][[:space:]]*=[[:space:]]*([0-9]+)'
     local pat_array_single='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*\((.*)\)$'
     local pat_array_start='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*\((.*)$'
     local pat_scalar='^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$'
@@ -304,11 +305,12 @@ parse_declarative_config() {
         # Associative array compound assignment: INTERFACE_WEIGHTS=( ["veth0"]=1 ["veth1"]=2 )
         if [[ "$line" =~ INTERFACE_WEIGHTS[[:space:]]*=[[:space:]]*\((.*)\) ]]; then
             local map_content="${BASH_REMATCH[1]}"
-            while [[ "$map_content" =~ \[[\"\']?([a-zA-Z0-9_.-]+)[\"\']?\][[:space:]]*=[[:space:]]*([0-9]+) ]]; do
+            while [[ "$map_content" =~ $pat_map_item ]]; do
                 local mk="${BASH_REMATCH[1]}"
                 local mv="${BASH_REMATCH[2]}"
                 INTERFACE_WEIGHTS["$mk"]="$mv"
-                map_content="${map_content#*${BASH_REMATCH[0]}}"
+                map_content="${map_content#*${mk}}"
+                map_content="${map_content#*${mv}}"
             done
             continue
         fi
@@ -323,7 +325,7 @@ parse_declarative_config() {
                 array_buffer+=" ${closing_content}"
                 local items=()
                 local raw_items
-                read -r -a raw_items <<< "$array_buffer"
+                IFS=$' \t\n' read -r -a raw_items <<< "$array_buffer"
                 for token in "${raw_items[@]}"; do
                     token="${token%,}"
                     token="${token%\"}"
@@ -358,7 +360,7 @@ parse_declarative_config() {
             arr_raw="${arr_raw%%#*}"
             local items=()
             local raw_items
-            read -r -a raw_items <<< "$arr_raw"
+            IFS=$' \t\n' read -r -a raw_items <<< "$arr_raw"
             for token in "${raw_items[@]}"; do
                 token="${token%,}"
                 token="${token%\"}"

@@ -14,6 +14,7 @@
   <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
   <img src="https://img.shields.io/badge/Tests-18%2F18%20Passing-brightgreen.svg" alt="Tests: 18/18 Passing">
   <img src="https://img.shields.io/badge/Version-1.1.0-blue.svg" alt="Version: 1.1.0">
+  <a href="ROADMAP.md"><img src="https://img.shields.io/badge/v2.0-Roadmap%20RFC-orange.svg" alt="v2.0 Roadmap RFC"></a>
 </p>
 
 `net-failover-watchdog` is a lightweight, hardened multi-WAN failover engine designed for Linux desktops, laptops, and edge devices that switch between **Ethernet**, **USB tethering / cellular modems**, and **Wi-Fi**.
@@ -336,6 +337,17 @@ The test matrix validates:
 16. Pure declarative configuration parser execution safety and shell injection immunity.
 17. Declarative configuration parser edge-case matrix (spaces, comments, quoting, arrays).
 18. Real adaptive probing backoff on persistently failed interfaces.
+
+---
+
+## v2.0 Architecture Roadmap (Accepted RFC)
+
+The project is evolving from its v1.x shell/subprocess architecture to a compiled, event-driven systems daemon. See [ROADMAP.md](ROADMAP.md) for the complete design specification covering:
+- **Netlink Event Loop (`rtnetlink`)**: Sub-millisecond reaction to link carrier events (`RTM_NEWLINK`) without polling loops.
+- **Zero Subprocess Overhead**: Replaces forked `ip`, `ping`, and `curl` subshells with direct Netlink sockets, async raw ICMP sockets, and non-blocking HTTP connection pools.
+- **NetworkManager D-Bus & PBR Coexistence**: Native metric coordination and Policy-Based Routing (PBR tables `100`/`200`) eliminating route contention.
+- **Decoupled Dual-Stack State Machines**: Independent parallel state actors for IPv4 and IPv6 failover (Happy Eyeballs / RFC 8305 compliant).
+- **Least-Privilege Sandboxing**: Drops root to an unprivileged system service user with ambient capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`) and strict seccomp filtering.
 
 ---
 

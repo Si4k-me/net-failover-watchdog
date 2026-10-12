@@ -11,6 +11,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DAEMON="${PROJECT_ROOT}/net-failover-watchdog"
+COMMON_LIB="${PROJECT_ROOT}/net-failover-common.sh"
 
 # Ensure test runs inside unshare if not already in an isolated namespace
 if [[ -z "${IN_TEST_NAMESPACE:-}" ]]; then
@@ -443,7 +444,7 @@ info "Test 15: IPv6 Dual-Stack Default Route Metric Synchronization"
 ip -6 addr add 2001:db8:10::2/64 dev veth0 2>/dev/null || true
 ip -6 addr add 2001:db8:20::2/64 dev veth1 2>/dev/null || true
 ip -6 route add default via 2001:db8:10::1 dev veth0 metric 1024 2>/dev/null || true
-ip -6 route add default via 2001:db8:20::1 dev veth1 metric 1024 2>/dev/null || true
+ip -6 route add default via 2001:db8:20::1 dev veth1 metric 1025 2>/dev/null || true
 
 V6_CONF="${TEST_TMP}/v6_test.conf"
 cp "${TEST_TMP}/test.conf" "$V6_CONF"
@@ -558,11 +559,11 @@ cp "${TEST_TMP}/test.conf" "$ADAPTIVE_CONF"
 echo "ADAPTIVE_PROBING=true" >> "$ADAPTIVE_CONF"
 
 FORCE_ADAPTIVE_BACKOFF=true WATCHDOG_CYCLE_COUNT=0 "$DAEMON" -c "$ADAPTIVE_CONF" --once >/dev/null 2>&1
-calls_on_skipped_cycle=$(grep -c "ping called on" "$PROBE_LOG" 2>/dev/null || echo 0)
+calls_on_skipped_cycle=$(grep -c -- "-I veth0" "$PROBE_LOG" 2>/dev/null || true)
 
 # Cycle 5 (WATCHDOG_CYCLE_COUNT=4 + 1 = 5, mod 5 = 0): probe must be EXECUTED
 WATCHDOG_CYCLE_COUNT=4 FORCE_ADAPTIVE_BACKOFF=true "$DAEMON" -c "$ADAPTIVE_CONF" --once >/dev/null 2>&1
-calls_on_sampled_cycle=$(grep -c "ping called on" "$PROBE_LOG" 2>/dev/null || echo 0)
+calls_on_sampled_cycle=$(grep -c -- "-I veth0" "$PROBE_LOG" 2>/dev/null || true)
 
 # Restore standard mock ping
 cat <<'EOF' > "${TEST_BIN_DIR}/ping"
