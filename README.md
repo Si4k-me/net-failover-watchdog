@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://archlinux.org"><img src="https://img.shields.io/badge/Platform-Arch%20Linux-blue.svg" alt="Platform: Arch Linux"></a>
-  <img src="https://img.shields.io/badge/Tests-12%2F12%20Passing-brightgreen.svg" alt="Tests: 12/12 Passing">
+  <img src="https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen.svg" alt="Tests: 14/14 Passing">
 </p>
 
 `net-failover-watchdog` is a lightweight, hardened multi-WAN failover engine designed for Linux desktops, laptops, and edge devices that switch between **Ethernet**, **USB tethering / cellular modems**, and **Wi-Fi**.
@@ -317,6 +317,10 @@ The test matrix validates:
 8. Point-to-point and device-only (`default dev <iface>`) route reconciliation.
 9. `systemd-resolved` `resolvectl` routing domain alignment and cache flushing.
 10. Dry-run mode non-destructive execution.
+11. Dynamic priority reconfiguration via CLI & SIGHUP reload.
+12. CLI priority reset & reversion to defaults.
+13. Configuration file security ingestion guard (rejecting disallowed command substitution).
+14. Non-hostile space-separated and quoted priority CLI syntax.
 
 ---
 

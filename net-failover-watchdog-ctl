@@ -235,24 +235,7 @@ cmd_priority_show() {
 
     local discovered_any=false
     local iface_list=()
-    if [[ -d /sys/class/net ]]; then
-        for p in /sys/class/net/*; do
-            [[ ! -e "$p" ]] && continue
-            local ifname="${p##*/}"
-            [[ "$ifname" =~ ^(lo|docker|veth|virbr|tun|tap|wg|br-|podman) ]] && continue
-            iface_list+=("$ifname")
-        done
-    fi
-
-    # Also check ip link if namespace or sysfs not populated
-    if [[ ${#iface_list[@]} -eq 0 ]]; then
-        while IFS= read -r line; do
-            local ifname
-            ifname=$(echo "$line" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')
-            [[ -z "$ifname" || "$ifname" =~ ^(lo|docker|veth|virbr|tun|tap|wg|br-|podman) ]] && continue
-            iface_list+=("$ifname")
-        done < <(ip -o link show 2>/dev/null || true)
-    fi
+    mapfile -t iface_list < <(discover_interfaces)
 
     for dev in "${iface_list[@]}"; do
         discovered_any=true

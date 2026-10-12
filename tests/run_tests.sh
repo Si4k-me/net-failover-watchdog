@@ -288,6 +288,7 @@ fi
 # -----------------------------------------------------------------------------
 info "Test 9: Systemd-Resolved Synchronization Mock"
 RESOLVECTL_LOG="${TEST_TMP}/resolvectl.log"
+rm -f "${RESOLVECTL_LOG}" "${TEST_STATE_DIR}/primary.dns"
 cat <<EOF > "${TEST_BIN_DIR}/resolvectl"
 #!/usr/bin/env bash
 echo "\$@" >> "${RESOLVECTL_LOG}"
@@ -303,7 +304,16 @@ active_backup=$(ip -4 route show default | awk '$0 ~ /metric 200/ {for(i=1;i<=NF
 if [[ -n "$active_primary" ]] && \
    grep -q "default-route ${active_primary} yes" "$RESOLVECTL_LOG" && \
    grep -q "flush-caches" "$RESOLVECTL_LOG"; then
-    pass "DNS resolvectl default-route synchronization and cache flushing confirmed"
+    # Run second cycle with same primary and ensure flush-caches is NOT called redundantly
+    flush_count_before=$(grep -c "flush-caches" "$RESOLVECTL_LOG" || echo 0)
+    "$DAEMON" -c "${TEST_TMP}/test.conf" --once >/dev/null 2>&1
+    flush_count_after=$(grep -c "flush-caches" "$RESOLVECTL_LOG" || echo 0)
+
+    if [[ "$flush_count_after" -eq "$flush_count_before" ]]; then
+        pass "DNS resolvectl default-route synchronization and change-only cache flushing confirmed"
+    else
+        fail "DNS cache flush was called redundantly when primary did not change" "Before: $flush_count_before, After: $flush_count_after"
+    fi
 else
     fail "DNS resolvectl calls did not match expected sequence" "$(cat "$RESOLVECTL_LOG" 2>/dev/null || echo 'empty')"
 fi

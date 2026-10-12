@@ -22,6 +22,7 @@ DROP_IN_DIR="${DROP_IN_DIR:-/etc/net-failover-watchdog.d}"
 # Flag set by SIGHUP handler to trigger config reload in the main loop
 FLAG_RELOAD=false
 FLAG_FORCE_REORDER=false
+LAST_SYNCED_PRIMARY=""
 
 CHECK_INTERVAL=3
 
@@ -236,6 +237,7 @@ perform_reload() {
     load_configuration
     FLAG_RELOAD=false
     FLAG_FORCE_REORDER=true
+    LAST_SYNCED_PRIMARY=""
     log_info "Configuration reloaded. New weights: LAN=${WEIGHT_LAN} USB=${WEIGHT_USB} WIFI=${WEIGHT_WIFI} OTHER=${WEIGHT_OTHER}"
 }
 
@@ -269,73 +271,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 trap handle_sighup HUP USR1
 
-# ---------------------------------------------------------
-# INTERFACE FILTERING & DISCOVERY
-# ---------------------------------------------------------
 
-is_ignored_interface() {
-    local iface="$1"
-    [[ -z "$iface" ]] && return 0
-    for pattern in "${IGNORED_INTERFACES[@]}"; do
-        # shellcheck disable=SC2053
-        if [[ "$iface" == $pattern ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-discover_interfaces() {
-    local candidates=()
-
-    if [[ "$MANAGED_INTERFACES" != "auto" && ${#MANAGED_INTERFACES[@]} -gt 0 ]]; then
-        for iface in "${MANAGED_INTERFACES[@]}"; do
-            [[ -z "$iface" ]] && continue
-            if [[ -d "/sys/class/net/${iface}" ]] || ip link show dev "$iface" >/dev/null 2>&1; then
-                candidates+=("$iface")
-            fi
-        done
-    else
-        # Auto-discovery
-        local sys_ifaces=()
-        if [[ -d /sys/class/net ]]; then
-            for devpath in /sys/class/net/*; do
-                [[ ! -e "$devpath" ]] && continue
-                local devname="${devpath##*/}"
-                [[ -z "$devname" ]] && continue
-                is_ignored_interface "$devname" && continue
-
-                if ip -4 route show default dev "$devname" 2>/dev/null | grep -q "^default"; then
-                    sys_ifaces+=("$devname")
-                elif is_interface_carrier_up "$devname" && has_ipv4_address "$devname"; then
-                    sys_ifaces+=("$devname")
-                fi
-            done
-        fi
-
-        # Also inspect ip link for namespaces/containers
-        while IFS= read -r line; do
-            local ifname
-            ifname=$(echo "$line" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')
-            [[ -z "$ifname" ]] && continue
-            is_ignored_interface "$ifname" && continue
-            if ip -4 route show default dev "$ifname" 2>/dev/null | grep -q "^default"; then
-                sys_ifaces+=("$ifname")
-            elif is_interface_carrier_up "$ifname" && has_ipv4_address "$ifname"; then
-                sys_ifaces+=("$ifname")
-            fi
-        done < <(ip -o link show 2>/dev/null || true)
-
-        # Deduplicate
-        if [[ ${#sys_ifaces[@]} -gt 0 ]]; then
-            IFS=$'\n' read -d '' -r -a candidates < <(printf '%s\n' "${sys_ifaces[@]}" | sort -u && printf '\0') || true
-        fi
-    fi
-
-    if [[ ${#candidates[@]} -gt 0 ]]; then
-        printf '%s\n' "${candidates[@]}"
-    fi
-}
 
 # ---------------------------------------------------------
 # KERNEL SYSCTL & REVERSE PATH FILTERING INSPECTION
@@ -837,9 +773,20 @@ run_watchdog_cycle() {
         fi
     done
 
-    # Synchronize systemd-resolved DNS routing domains
-    if [[ -n "$target_primary" ]]; then
+    # Synchronize systemd-resolved DNS routing domains only when primary switches
+    local last_dns_file="${STATE_DIR}/primary.dns"
+    local last_synced="${LAST_SYNCED_PRIMARY:-}"
+    if [[ -z "$last_synced" && -f "$last_dns_file" ]]; then
+        last_synced=$(cat "$last_dns_file" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$target_primary" && "$target_primary" != "$last_synced" ]]; then
         sync_dns_resolver "$target_primary" "${candidate_ifaces[@]}"
+        LAST_SYNCED_PRIMARY="$target_primary"
+        if [[ "$FLAG_DRY_RUN" == false ]]; then
+            mkdir -p "$STATE_DIR" 2>/dev/null || true
+            echo "$target_primary" > "$last_dns_file" 2>/dev/null || true
+        fi
     fi
 }
 

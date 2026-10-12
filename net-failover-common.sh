@@ -140,6 +140,83 @@ get_interface_gateway() {
 }
 
 # ---------------------------------------------------------
+# INTERFACE DISCOVERY & FILTERING
+# ---------------------------------------------------------
+
+DEFAULT_IGNORED_INTERFACES=("lo" "docker*" "veth*" "virbr*" "tun*" "tap*" "wg*" "br-*" "podman*" "vmnet*" "vboxnet*")
+
+is_ignored_interface() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return 0
+
+    local patterns=("${DEFAULT_IGNORED_INTERFACES[@]}")
+    if [[ -n "${IGNORED_INTERFACES[*]:-}" ]]; then
+        patterns=("${IGNORED_INTERFACES[@]}")
+    fi
+
+    for pattern in "${patterns[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$iface" == $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+discover_interfaces() {
+    local candidates=()
+    local managed="${MANAGED_INTERFACES:-auto}"
+
+    if [[ "$managed" != "auto" && ${#MANAGED_INTERFACES[@]} -gt 0 ]]; then
+        for iface in "${MANAGED_INTERFACES[@]}"; do
+            [[ -z "$iface" ]] && continue
+            if [[ -d "/sys/class/net/${iface}" ]] || ip link show dev "$iface" >/dev/null 2>&1; then
+                candidates+=("$iface")
+            fi
+        done
+    else
+        # Auto-discovery via sysfs
+        local sys_ifaces=()
+        if [[ -d /sys/class/net ]]; then
+            for devpath in /sys/class/net/*; do
+                [[ ! -e "$devpath" ]] && continue
+                local devname="${devpath##*/}"
+                [[ -z "$devname" ]] && continue
+                is_ignored_interface "$devname" && continue
+
+                if ip -4 route show default dev "$devname" 2>/dev/null | grep -q "^default"; then
+                    sys_ifaces+=("$devname")
+                elif is_interface_carrier_up "$devname" && has_ipv4_address "$devname"; then
+                    sys_ifaces+=("$devname")
+                fi
+            done
+        fi
+
+        # Also inspect ip link for namespaces/containers
+        while IFS= read -r line; do
+            local ifname
+            ifname=$(echo "$line" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')
+            [[ -z "$ifname" ]] && continue
+            is_ignored_interface "$ifname" && continue
+            if ip -4 route show default dev "$ifname" 2>/dev/null | grep -q "^default"; then
+                sys_ifaces+=("$ifname")
+            elif is_interface_carrier_up "$ifname" && has_ipv4_address "$ifname"; then
+                sys_ifaces+=("$ifname")
+            fi
+        done < <(ip -o link show 2>/dev/null || true)
+
+        # Deduplicate
+        if [[ ${#sys_ifaces[@]} -gt 0 ]]; then
+            IFS=$'\n' read -d '' -r -a candidates < <(printf '%s\n' "${sys_ifaces[@]}" | sort -u && printf '\0') || true
+        fi
+    fi
+
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+        printf '%s\n' "${candidates[@]}"
+    fi
+}
+
+# ---------------------------------------------------------
 # CONFIGURATION SECURITY VALIDATION
 # ---------------------------------------------------------
 
