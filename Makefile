@@ -4,6 +4,7 @@ SYSTEMDDIR ?= $(PREFIX)/lib/systemd/system
 DOCDIR ?= $(PREFIX)/share/doc/net-failover-watchdog
 LICENSEDIR ?= $(PREFIX)/share/licenses/net-failover-watchdog
 BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib/net-failover-watchdog
 
 .PHONY: all test check install uninstall clean
 
@@ -19,6 +20,9 @@ install:
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 net-failover-watchdog "$(DESTDIR)$(BINDIR)/net-failover-watchdog"
 	install -m 755 net-failover-watchdog-ctl "$(DESTDIR)$(BINDIR)/net-failover-watchdog-ctl"
+
+	install -d "$(DESTDIR)$(LIBDIR)"
+	install -m 644 net-failover-common.sh "$(DESTDIR)$(LIBDIR)/net-failover-common.sh"
 
 	install -d "$(DESTDIR)$(SYSTEMDDIR)"
 	install -m 644 net-failover-watchdog.service "$(DESTDIR)$(SYSTEMDDIR)/net-failover-watchdog.service"
@@ -39,6 +43,7 @@ install:
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/net-failover-watchdog"
 	rm -f "$(DESTDIR)$(BINDIR)/net-failover-watchdog-ctl"
+	rm -rf "$(DESTDIR)$(LIBDIR)"
 	rm -f "$(DESTDIR)$(SYSTEMDDIR)/net-failover-watchdog.service"
 	rm -f "$(DESTDIR)$(SYSCONFDIR)/net-failover-watchdog.conf"
 	rm -rf "$(DESTDIR)$(DOCDIR)"

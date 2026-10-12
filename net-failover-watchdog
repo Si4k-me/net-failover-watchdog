@@ -165,12 +165,41 @@ parse_args() {
 parse_args "$@"
 
 # ---------------------------------------------------------
+# SHARED LIBRARY RESOLUTION
+# ---------------------------------------------------------
+resolve_common_lib() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [[ -n "${NET_FAILOVER_COMMON_LIB:-}" && -f "${NET_FAILOVER_COMMON_LIB}" ]]; then
+        echo "${NET_FAILOVER_COMMON_LIB}"
+    elif [[ -f "${script_dir}/net-failover-common.sh" ]]; then
+        echo "${script_dir}/net-failover-common.sh"
+    elif [[ -f "/usr/lib/net-failover-watchdog/net-failover-common.sh" ]]; then
+        echo "/usr/lib/net-failover-watchdog/net-failover-common.sh"
+    else
+        return 1
+    fi
+}
+
+COMMON_LIB=$(resolve_common_lib) || {
+    echo "ERROR: net-failover-common.sh library not found." >&2
+    exit 1
+}
+# shellcheck source=/dev/null
+source "$COMMON_LIB"
+
+# ---------------------------------------------------------
 # CONFIGURATION INGESTION
 # ---------------------------------------------------------
 # Load main config and any drop-in overrides.
 # Sourcing in global file scope so declare and array assignments are not local.
 load_configuration() {
     if [[ -f "$CONFIG_FILE" ]]; then
+        if ! verify_config_file_safety "$CONFIG_FILE"; then
+            log_error "Refusing to load insecure configuration from ${CONFIG_FILE}"
+            return 1
+        fi
         log_debug "Loading configuration from ${CONFIG_FILE}"
         # Transform any declare without -g into declare -g to ensure global scope
         # shellcheck source=/dev/null
@@ -184,6 +213,10 @@ load_configuration() {
         local drop_in
         for drop_in in "${DROP_IN_DIR}"/*.conf; do
             [[ ! -f "$drop_in" ]] && continue
+            if ! verify_config_file_safety "$drop_in"; then
+                log_error "Refusing to load insecure drop-in configuration: ${drop_in}"
+                continue
+            fi
             log_debug "Loading drop-in configuration: ${drop_in}"
             # shellcheck source=/dev/null
             source <(sed -E 's/^[[:space:]]*declare -A/declare -g -A/' "$drop_in")
@@ -237,117 +270,8 @@ trap cleanup EXIT INT TERM
 trap handle_sighup HUP USR1
 
 # ---------------------------------------------------------
-# HARDWARE INTROSPECTION & CLASSIFICATION
+# INTERFACE FILTERING & DISCOVERY
 # ---------------------------------------------------------
-classify_interface() {
-    local iface="$1"
-    [[ -z "$iface" ]] && { echo "$WEIGHT_OTHER"; return 0; }
-
-    # User configured weight overrides
-    if [[ -n "${INTERFACE_WEIGHTS[$iface]:-}" ]]; then
-        echo "${INTERFACE_WEIGHTS[$iface]}"
-        return 0
-    fi
-
-    local syspath="/sys/class/net/${iface}"
-    if [[ ! -d "$syspath" ]]; then
-        echo "$WEIGHT_OTHER"
-        return 0
-    fi
-
-    # 802.11 Wireless Architecture
-    if [[ -d "${syspath}/wireless" || -d "${syspath}/phy80211" ]]; then
-        echo "$WEIGHT_WIFI"
-        return 0
-    fi
-
-    # Hardware Bus Topology
-    if [[ -d "${syspath}/device" ]]; then
-        local devlink
-        devlink=$(readlink -f "${syspath}/device" 2>/dev/null || echo "")
-
-        # USB Bus (Cellular Dongles, LTE Modems, Phone Tethering)
-        if [[ "$devlink" =~ /usb[0-9]+ ]]; then
-            echo "$WEIGHT_USB"
-            return 0
-        fi
-
-        # Check Kernel Driver Binding
-        local driverlink
-        driverlink=$(readlink -f "${syspath}/device/driver" 2>/dev/null || echo "")
-        local driver="${driverlink##*/}"
-        case "$driver" in
-            cdc_ether|rndis_host|cdc_ncm|qmi_wwan|cdc_mbim|huawei_cdc_ncm|rndis_wlan)
-                echo "$WEIGHT_USB"
-                return 0
-                ;;
-        esac
-
-        # Physical PCI / PCIe / Onboard Ethernet Controllers
-        if [[ "$devlink" =~ /pci[0-9a-fA-F:]+ ]]; then
-            echo "$WEIGHT_LAN"
-            return 0
-        fi
-    fi
-
-    echo "$WEIGHT_OTHER"
-}
-
-is_interface_carrier_up() {
-    local iface="$1"
-    [[ -z "$iface" ]] && return 1
-
-    local syspath="/sys/class/net/${iface}"
-    if [[ -d "$syspath" ]]; then
-        local operstate="down"
-        local carrier="0"
-
-        [[ -f "${syspath}/operstate" ]] && operstate=$(cat "${syspath}/operstate" 2>/dev/null || echo "down")
-        [[ -f "${syspath}/carrier" ]] && carrier=$(cat "${syspath}/carrier" 2>/dev/null || echo "0")
-
-        # Some wireless/CDC drivers report operstate as 'unknown' when carrier is 1
-        if [[ ("$operstate" == "up" || "$operstate" == "unknown") && "$carrier" == "1" ]]; then
-            return 0
-        fi
-        return 1
-    fi
-
-    # Fallback when /sys/class/net is not available (e.g. network namespaces / containers)
-    local link_info
-    link_info=$(ip link show dev "$iface" 2>/dev/null || echo "")
-    if [[ -n "$link_info" && ! "$link_info" =~ NO-CARRIER && ("$link_info" =~ state\ UP || "$link_info" =~ LOWER_UP) ]]; then
-        return 0
-    fi
-    return 1
-}
-
-has_ipv4_address() {
-    local iface="$1"
-    [[ -z "$iface" ]] && return 1
-    ip -4 addr show dev "$iface" 2>/dev/null | grep -q "inet "
-}
-
-get_interface_gateway() {
-    local iface="$1"
-    [[ -z "$iface" ]] && return 1
-
-    local route_line
-    route_line=$(ip -4 route show default dev "$iface" 2>/dev/null | head -n 1 || true)
-    [[ -z "$route_line" ]] && return 1
-
-    if [[ "$route_line" =~ via\ ([0-9a-fA-F.:]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
-    fi
-
-    # Device-only route (point-to-point or link-scoped without via)
-    if [[ "$route_line" =~ ^default ]]; then
-        echo "dev"
-        return 0
-    fi
-
-    return 1
-}
 
 is_ignored_interface() {
     local iface="$1"
@@ -724,14 +648,8 @@ show_status() {
         local carrier="DOWN"
         is_interface_carrier_up "$iface" && carrier="UP"
 
-        local weight
-        weight=$(classify_interface "$iface")
-        local type="Other"
-        case "$weight" in
-            "$WEIGHT_LAN") type="LAN (PCI)" ;;
-            "$WEIGHT_USB") type="USB/Cell" ;;
-            "$WEIGHT_WIFI") type="Wi-Fi" ;;
-        esac
+        local type
+        type=$(detect_interface_type "$iface")
 
         local gw
         gw=$(get_interface_gateway "$iface" 2>/dev/null || echo "None")

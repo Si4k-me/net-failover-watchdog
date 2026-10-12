@@ -395,6 +395,37 @@ else
     fail "Priority reset did not delete priority.conf" "${TEST_DROP_IN}/priority.conf persists"
 fi
 
+# -----------------------------------------------------------------------------
+# TEST 13: Configuration File Security Ingestion Guard
+# -----------------------------------------------------------------------------
+info "Test 13: Configuration Security Validation (Reject Malicious Command Substitution)"
+INSECURE_CONF="${TEST_TMP}/insecure.conf"
+cat <<EOF > "$INSECURE_CONF"
+CHECK_INTERVAL=1
+EXPLOIT=\$(touch "${TEST_TMP}/should_not_exist")
+EOF
+
+sec_output=$("$DAEMON" -c "$INSECURE_CONF" --once 2>&1 || true)
+if [[ ! -f "${TEST_TMP}/should_not_exist" ]] && echo "$sec_output" | grep -q "Refusing to load insecure configuration"; then
+    pass "Configuration security verified: disallowed command substitution rejected without execution"
+else
+    fail "Configuration security failed" "File was executed or warning missing. Output: $sec_output"
+fi
+
+# -----------------------------------------------------------------------------
+# TEST 14: Space-separated and Quoted Priority CLI Commands
+# -----------------------------------------------------------------------------
+info "Test 14: Non-hostile Shell Priority Syntax (Space-separated & Quoted '>')"
+CONFIG_FILE="${TEST_TMP}/test.conf" DROP_IN_DIR="${TEST_DROP_IN}" \
+"$CTL" priority set veth1 veth0 >/dev/null 2>&1
+
+if grep -q 'INTERFACE_WEIGHTS\["veth1"\]=1' "${TEST_DROP_IN}/priority.conf" 2>/dev/null && \
+   grep -q 'INTERFACE_WEIGHTS\["veth0"\]=2' "${TEST_DROP_IN}/priority.conf" 2>/dev/null; then
+    pass "Space-separated priority CLI syntax verified without requiring shell redirection operators"
+else
+    fail "Space-separated priority CLI syntax failed" "$(cat "${TEST_DROP_IN}/priority.conf" 2>/dev/null || echo 'missing')"
+fi
+
 echo "============================================================"
 echo " Test Summary: ${PASSED_COUNT} Passed, ${FAILED_COUNT} Failed"
 echo "============================================================"

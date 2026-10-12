@@ -135,18 +135,25 @@ You can dynamically reorder failover priorities using `net-failover-watchdog-ctl
 
 Prioritize USB tethering over Ethernet:
 ```bash
-sudo net-failover-watchdog-ctl priority set usb > lan > wifi > other
+# Space-separated (recommended):
+sudo net-failover-watchdog-ctl priority set usb lan wifi other
+
+# Or quoted when using '>' (quotes prevent shell output redirection):
+sudo net-failover-watchdog-ctl priority set 'usb > lan > wifi > other'
 ```
-*(Also supports `usb>lan>wifi>other`, `usb,lan,wifi,other`, or space-separated `usb lan wifi other`)*
+*(Always quote `'>'` in shell commands to prevent Bash output redirection, or use space/comma separation: `usb lan wifi other`, `usb,lan,wifi,other`)*
 
 #### Handle Multiple LANs, USB Modems, or Wi-Fi Cards
 
 If your machine has multiple Ethernet ports, USB tethering devices, or Wi-Fi adapters, specify the exact interface order:
 ```bash
-# Position-based priority (left to right = highest to lowest)
-sudo net-failover-watchdog-ctl priority set eth0 > usb0 > enp3s0 > wlan0
+# Space-separated position-based priority (left to right = highest to lowest):
+sudo net-failover-watchdog-ctl priority set eth0 usb0 enp3s0 wlan0
 
-# Or assign explicit numeric weights (lower number = higher preference)
+# Or quote-wrapped:
+sudo net-failover-watchdog-ctl priority set 'eth0 > usb0 > enp3s0 > wlan0'
+
+# Or assign explicit numeric weights (lower number = higher preference):
 sudo net-failover-watchdog-ctl priority set eth0=1 usb0=2 enp3s0=3 wlan0=4
 ```
 
@@ -209,6 +216,60 @@ sudo net-failover-watchdog-ctl priority reset
 | `IGNORED_INTERFACES`| `("lo" "docker*" "veth*" "vmnet*" ...)` | Interface globs ignored by discovery |
 | `DNS_SYNC_ENABLED` | `true` | Synchronize per-link routing domains with `systemd-resolved` |
 | `AUTO_CONFIG_RP_FILTER`| `false` | Enable loose rp_filter on managed interfaces only |
+
+---
+
+## Network Manager Co-existence & Best Practices
+
+`net-failover-watchdog` manages default routes (`0.0.0.0/0`) in the kernel IPv4 FIB by continuously reconciling interface metrics:
+- **Primary link**: Metric `50` (`METRIC_PRIMARY`)
+- **Standby links**: Metric `200` (`METRIC_BACKUP`)
+- **Degraded/Unresponsive links**: Metric `500` (`METRIC_DEGRADED`)
+
+When DHCP clients or network managers (such as NetworkManager, `systemd-networkd`, or `dhcpcd`) renew leases, they may attempt to inject their own default routes. `net-failover-watchdog` automatically purges stale or unmetered routes, but to prevent unnecessary route churn and log noise, configure your network manager to cooperate:
+
+### NetworkManager
+
+Ensure NetworkManager connections do not inject conflicting lower-metric default routes:
+
+1. **Assign high DHCP route metrics to connections**:
+   Set `ipv4.route-metric` to `1000` so that any DHCP default routes installed by NetworkManager have lower precedence than the watchdog's metrics (50 and 200):
+   ```bash
+   nmcli connection modify "Wired connection 1" ipv4.route-metric 1000
+   nmcli connection modify "Wi-Fi connection" ipv4.route-metric 1000
+   ```
+2. **Prevent secondary links from installing default routes via NM**:
+   If an interface (like metered USB tethering or a secondary Wi-Fi) is strictly for failover, instruct NetworkManager never to install a default route for it:
+   ```bash
+   nmcli connection modify "Hotspot Tether" ipv4.never-default true
+   ```
+   `net-failover-watchdog` will install and manage the default route when needed.
+
+### systemd-networkd
+
+In your `/etc/systemd/network/*.network` profile files, configure a higher metric under `[DHCPv4]` or `[Route]`:
+```ini
+[DHCPv4]
+RouteMetric=1000
+```
+
+### dhcpcd
+
+In `/etc/dhcpcd.conf`, configure default metric offsets:
+```text
+metric 1000
+```
+
+---
+
+## Health Checks & Layer 7 Captive Portal Verification
+
+### Why Plain HTTP for Captive Portal Detection?
+
+Layer 7 checks use plain HTTP (`http://`) endpoints rather than HTTPS by design:
+- When connected to a public Wi-Fi or cellular network that requires captive portal login (hotels, airports), the network intercepts port 80 HTTP requests with an HTTP 302 redirect or login page.
+- If HTTPS were used, the TLS handshake would fail immediately with a certificate mismatch error (`SEC_ERROR_UNKNOWN_ISSUER` or `curl error 60`) rather than revealing the portal redirect.
+- If Layer 7 checks are not desired (e.g. on isolated private networks or when minimizing egress traffic), set `L7_CHECK_ENABLED=false` in `/etc/net-failover-watchdog.conf`.
 
 ---
 

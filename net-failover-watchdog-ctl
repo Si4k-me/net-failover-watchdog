@@ -20,6 +20,31 @@ readonly STATE_DIR="/run/net-failover-watchdog"
 readonly DAEMON_BIN="net-failover-watchdog"
 
 # ---------------------------------------------------------
+# SHARED LIBRARY RESOLUTION
+# ---------------------------------------------------------
+resolve_common_lib() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [[ -n "${NET_FAILOVER_COMMON_LIB:-}" && -f "${NET_FAILOVER_COMMON_LIB}" ]]; then
+        echo "${NET_FAILOVER_COMMON_LIB}"
+    elif [[ -f "${script_dir}/net-failover-common.sh" ]]; then
+        echo "${script_dir}/net-failover-common.sh"
+    elif [[ -f "/usr/lib/net-failover-watchdog/net-failover-common.sh" ]]; then
+        echo "/usr/lib/net-failover-watchdog/net-failover-common.sh"
+    else
+        return 1
+    fi
+}
+
+COMMON_LIB=$(resolve_common_lib) || {
+    echo "ERROR: net-failover-common.sh library not found." >&2
+    exit 1
+}
+# shellcheck source=/dev/null
+source "$COMMON_LIB"
+
+# ---------------------------------------------------------
 # COLOUR AND OUTPUT HELPERS
 # ---------------------------------------------------------
 RED='\033[0;31m'
@@ -93,71 +118,6 @@ apply_new_order() {
     fi
 }
 
-# ---------------------------------------------------------
-# HARDWARE INTROSPECTION (FOR STATUS & SHOW)
-# ---------------------------------------------------------
-detect_interface_type() {
-    local iface="$1"
-    local syspath="/sys/class/net/${iface}"
-
-    if [[ ! -d "$syspath" ]]; then
-        echo "Other"
-        return 0
-    fi
-
-    if [[ -d "${syspath}/wireless" || -d "${syspath}/phy80211" ]]; then
-        echo "Wi-Fi"
-        return 0
-    fi
-
-    if [[ -d "${syspath}/device" ]]; then
-        local devlink
-        devlink=$(readlink -f "${syspath}/device" 2>/dev/null || echo "")
-
-        if [[ "$devlink" =~ /usb[0-9]+ ]]; then
-            echo "USB/Cell"
-            return 0
-        fi
-
-        local driverlink
-        driverlink=$(readlink -f "${syspath}/device/driver" 2>/dev/null || echo "")
-        local driver="${driverlink##*/}"
-        case "$driver" in
-            cdc_ether|rndis_host|cdc_ncm|qmi_wwan|cdc_mbim|huawei_cdc_ncm|rndis_wlan)
-                echo "USB/Cell"
-                return 0
-                ;;
-        esac
-
-        if [[ "$devlink" =~ /pci[0-9a-fA-F:]+ ]]; then
-            echo "LAN (PCI)"
-            return 0
-        fi
-    fi
-
-    echo "Other"
-}
-
-is_interface_carrier_up() {
-    local iface="$1"
-    local syspath="/sys/class/net/${iface}"
-    if [[ -d "$syspath" ]]; then
-        local operstate="down"
-        local carrier="0"
-        [[ -f "${syspath}/operstate" ]] && operstate=$(cat "${syspath}/operstate" 2>/dev/null || echo "down")
-        [[ -f "${syspath}/carrier" ]] && carrier=$(cat "${syspath}/carrier" 2>/dev/null || echo "0")
-        if [[ ("$operstate" == "up" || "$operstate" == "unknown") && "$carrier" == "1" ]]; then
-            return 0
-        fi
-        return 1
-    fi
-    local link_info
-    link_info=$(ip link show dev "$iface" 2>/dev/null || echo "")
-    if [[ -n "$link_info" && ! "$link_info" =~ NO-CARRIER && ("$link_info" =~ state\ UP || "$link_info" =~ LOWER_UP) ]]; then
-        return 0
-    fi
-    return 1
-}
 
 # ---------------------------------------------------------
 # PRIORITY CONFIGURATION I/O
@@ -358,9 +318,13 @@ cmd_priority_set() {
     if [[ $# -eq 0 ]]; then
         die "Usage: $0 priority set <order...>
 Examples:
-  $0 priority set lan > usb > wifi > other
-  $0 priority set lan>usb>wifi>other
-  $0 priority set eth0 > usb0 > enp3s0 > wlan0
+  # Space-separated:
+  $0 priority set lan usb wifi other
+  $0 priority set eth0 usb0 enp3s0 wlan0
+  # Quoted when using '>' (quotes prevent shell redirection):
+  $0 priority set 'lan > usb > wifi > other'
+  $0 priority set 'eth0 > usb0 > enp3s0 > wlan0'
+  # Explicit weights:
   $0 priority set eth0=1 usb0=2 enp3s0=3"
     fi
 
@@ -530,12 +494,14 @@ Commands:
 
 Priority Configuration Examples:
   # Set hardware type hierarchy (LAN > USB Tethering > Wi-Fi > Other):
-    sudo net-failover-watchdog-ctl priority set lan > usb > wifi > other
-    sudo net-failover-watchdog-ctl priority set lan>usb>wifi>other
-    sudo net-failover-watchdog-ctl priority set usb > lan > wifi > other
+  # NOTE: Always quote '>' in shell commands to prevent stdout redirection!
+    sudo net-failover-watchdog-ctl priority set lan usb wifi other
+    sudo net-failover-watchdog-ctl priority set 'lan > usb > wifi > other'
+    sudo net-failover-watchdog-ctl priority set 'usb > lan > wifi > other'
 
   # Set specific interface order (when multiple LANs/USBs/Wi-Fis exist):
-    sudo net-failover-watchdog-ctl priority set eth0 > usb0 > enp3s0 > wlan0
+    sudo net-failover-watchdog-ctl priority set eth0 usb0 enp3s0 wlan0
+    sudo net-failover-watchdog-ctl priority set 'eth0 > usb0 > enp3s0 > wlan0'
     sudo net-failover-watchdog-ctl priority set eth0=1 usb0=2 enp3s0=3 wlan0=4
 
   # Revert back to defaults:
